@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nivo://ai/schemas/content-tagger-output/v1",
+  "title": "NIVO Content Tagger output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["category", "sub_category", "topics", "location", "scene", "style", "emotion"],
+  "properties": {
+    "category": {"type": "string", "minLength": 1, "maxLength": 32},
+    "sub_category": {"type": "string", "minLength": 1, "maxLength": 32},
+    "topics": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 40}, "minItems": 1, "maxItems": 12, "uniqueItems": true},
+    "location": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 40}, "maxItems": 8, "uniqueItems": true},
+    "scene": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 32}, "maxItems": 8, "uniqueItems": true},
+    "style": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 32}, "maxItems": 8, "uniqueItems": true},
+    "emotion": {"type": "string", "enum": ["positive", "neutral", "negative", "mixed", "unknown"]}
+  }
+}

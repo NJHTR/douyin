@@ -40,6 +40,7 @@ public class LiveController {
     private final LiveMediaProperties mediaProperties;
     private final LiveMediaTokenService mediaTokenService;
     private final LivePresenceService livePresenceService;
+    private final LiveStreamHandler liveStreamHandler;
 
     public LiveController(LiveService liveService, UserMapper userMapper,
                           FollowMapper followMapper, JwtUtil jwtUtil,
@@ -47,7 +48,8 @@ public class LiveController {
                           StreamingEngine streamingEngine,
                           LiveMediaProperties mediaProperties,
                           LiveMediaTokenService mediaTokenService,
-                          LivePresenceService livePresenceService) {
+                          LivePresenceService livePresenceService,
+                          LiveStreamHandler liveStreamHandler) {
         this.liveService = liveService;
         this.userMapper = userMapper;
         this.followMapper = followMapper;
@@ -57,6 +59,7 @@ public class LiveController {
         this.mediaProperties = mediaProperties;
         this.mediaTokenService = mediaTokenService;
         this.livePresenceService = livePresenceService;
+        this.liveStreamHandler = liveStreamHandler;
     }
 
     private Long getLoginUserId(HttpServletRequest req) {
@@ -100,7 +103,7 @@ public class LiveController {
         if (userId == null) return Result.fail("请先登录");
         LiveRoom room = liveService.endLive(id, userId);
         if (room == null) return Result.fail("直播间不存在或无权限");
-        LiveStreamHandler.broadcastEnd(id);
+        liveStreamHandler.broadcastEnd(id);
         return Result.ok(room);
     }
 

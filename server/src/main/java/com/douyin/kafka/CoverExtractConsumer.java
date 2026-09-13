@@ -19,7 +19,7 @@ import org.springframework.stereotype.Service;
  */
 @Slf4j
 @Service
-@ConditionalOnProperty(value = "douyin.kafka.enabled", havingValue = "true")
+@ConditionalOnProperty(name = {"douyin.kafka.enabled", "minio.enabled"}, havingValue = "true")
 public class CoverExtractConsumer {
 
     private final CoverService coverService;

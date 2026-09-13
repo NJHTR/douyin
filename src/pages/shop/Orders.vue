@@ -13,7 +13,12 @@
       </span>
     </header>
 
-    <div class="order-list" v-if="list.length">
+    <div v-if="loading && !list.length" class="page-state">订单加载中...</div>
+    <div v-else-if="error && !list.length" class="page-state error-state">
+      <span>{{ error }}</span>
+      <button type="button" @click="fetchOrders()">重试</button>
+    </div>
+    <div class="order-list" v-else-if="list.length">
       <div class="order-item" v-for="order in list" :key="order.id">
         <div class="o-header">
           <span class="o-status">{{ statusText(order.status) }}</span>
@@ -32,13 +37,15 @@
         <div class="o-footer">
           <span class="o-total">合计：<b>￥{{ order.totalAmount }}</b></span>
           <span class="o-actions">
-            <span class="act-btn" v-if="order.status === 'PENDING'" @click="doCancel(order.id)">取消订单</span>
-            <span class="act-btn primary" v-if="order.status === 'SHIPPED'" @click="doReceive(order.id)">确认收货</span>
+            <button class="act-btn" v-if="order.status === 'PENDING'" :disabled="submittingId === order.id" @click="doCancel(order.id)">取消订单</button>
+            <button class="act-btn primary" v-if="order.status === 'SHIPPED'" :disabled="submittingId === order.id" @click="doReceive(order.id)">确认收货</button>
           </span>
         </div>
       </div>
 
-      <div class="load-more" v-if="hasMore" @click="fetchOrders(true)">加载更多</div>
+      <div class="load-more" v-if="hasMore" @click="fetchOrders(true)">
+        {{ loading ? '加载中...' : '加载更多' }}
+      </div>
     </div>
 
     <div class="empty" v-else>
@@ -52,7 +59,7 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { getOrders, cancelOrder, receiveOrder } from '@/api/user'
-import { _checkImgUrl } from '@/utils'
+import { _checkImgUrl, _notice } from '@/utils'
 import { Icon } from '@iconify/vue'
 
 defineOptions({ name: 'Orders' })
@@ -62,6 +69,9 @@ const list = ref<any[]>([])
 const activeTab = ref('')
 const pageNo = ref(1)
 const hasMore = ref(false)
+const loading = ref(false)
+const error = ref('')
+const submittingId = ref<number | null>(null)
 
 const tabs = [
   { key: '', label: '全部' },
@@ -85,13 +95,17 @@ function statusText(s: string) {
 }
 
 async function fetchOrders(loadMore = false) {
+  if (loading.value) return
   if (!loadMore) { pageNo.value = 1; list.value = [] }
+  loading.value = true
+  error.value = ''
   try {
     const res: any = await getOrders({
       status: activeTab.value || undefined,
       pageNo: pageNo.value,
       pageSize: 10
     })
+    if (!res.success) throw new Error(res.msg || res.message || '订单加载失败')
     const data = res.data || res
     const newList = data.list || data.records || []
     if (loadMore) {
@@ -101,21 +115,41 @@ async function fetchOrders(loadMore = false) {
     }
     hasMore.value = newList.length >= 10
     pageNo.value++
-  } catch { /* ignore */ }
+  } catch (e: any) {
+    error.value = e?.message || '订单加载失败，请重试'
+  } finally {
+    loading.value = false
+  }
 }
 
 async function doCancel(id: number) {
+  if (submittingId.value !== null) return
+  submittingId.value = id
   try {
-    await cancelOrder(id)
-    fetchOrders()
-  } catch { /* ignore */ }
+    const res = await cancelOrder(id)
+    if (!res.success) throw new Error(res.msg || res.message || '取消订单失败')
+    await fetchOrders()
+    _notice('订单已取消')
+  } catch (e: any) {
+    _notice(e?.message || '取消订单失败，请重试')
+  } finally {
+    submittingId.value = null
+  }
 }
 
 async function doReceive(id: number) {
+  if (submittingId.value !== null) return
+  submittingId.value = id
   try {
-    await receiveOrder(id)
-    fetchOrders()
-  } catch { /* ignore */ }
+    const res = await receiveOrder(id)
+    if (!res.success) throw new Error(res.msg || res.message || '确认收货失败')
+    await fetchOrders()
+    _notice('已确认收货')
+  } catch (e: any) {
+    _notice(e?.message || '确认收货失败，请重试')
+  } finally {
+    submittingId.value = null
+  }
 }
 
 onMounted(() => fetchOrders())
@@ -126,6 +160,24 @@ onMounted(() => fetchOrders())
   min-height: 100vh;
   background: #f5f5f5;
   color: #333;
+
+  .page-state {
+    min-height: 240rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12rem;
+    color: #777;
+
+    button {
+      border: 0;
+      border-radius: 4rem;
+      padding: 7rem 18rem;
+      color: white;
+      background: #fe2c55;
+    }
+  }
 
   .top-bar {
     position: sticky;

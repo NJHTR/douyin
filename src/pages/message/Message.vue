@@ -45,7 +45,7 @@
             </div>
           </div>
           <div class="card-content">
-            <div class="s-item avatar" @click="_no" :key="a.uid" v-for="a in data.recentAuthors">
+            <div class="s-item avatar" @click="nav('/people/user-home/' + a.uid)" :key="a.uid" v-for="a in data.recentAuthors">
               <img :src="_checkImgUrl(a.avatar_168x168?.url_list?.[0])" />
               <span>{{ a.nickname }}</span>
             </div>
@@ -64,7 +64,7 @@
             <div class="right"></div>
           </div>
           <div class="card-content">
-            <div class="s-item" @click="_no">
+            <div class="s-item" @click="nav('/me/wallet')">
               <Icon icon="ion:wallet-outline" />
               <span>我的钱包</span>
             </div>
@@ -76,7 +76,7 @@
               <Icon icon="icon-park-outline:bytedance-applets" />
               <span>小程序</span>
             </div>
-            <div class="s-item" @click="_no">
+            <div class="s-item" @click="nav('/me/right-menu/look-history')">
               <Icon icon="solar:history-linear" />
               <span>观看历史</span>
             </div>
@@ -88,7 +88,7 @@
               <Icon icon="iconoir:cloud-download" />
               <span>离线模式</span>
             </div>
-            <div class="s-item" @click="_no">
+            <div class="s-item" @click="nav('/me/right-menu/setting')">
               <Icon icon="ep:setting" />
               <span>设置</span>
             </div>

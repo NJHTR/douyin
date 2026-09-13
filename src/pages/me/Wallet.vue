@@ -6,6 +6,13 @@
       <span></span>
     </header>
 
+    <div v-if="loading" class="page-state">钱包加载中...</div>
+    <div v-else-if="loadError" class="page-state error-state">
+      <span>{{ loadError }}</span>
+      <button type="button" @click="loadWallet">重试</button>
+    </div>
+
+    <template v-else>
     <div class="balance-card">
       <div class="label">账户余额（元）</div>
       <div class="value">￥{{ balance }}</div>
@@ -53,6 +60,7 @@
       </div>
       <div class="tx-empty" v-else>暂无交易记录</div>
     </div>
+    </template>
   </div>
 </template>
 
@@ -61,6 +69,7 @@ import { ref, onMounted, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { Icon } from '@iconify/vue'
 import { getBalance, recharge, getTransactions } from '@/api/wallet'
+import { _notice } from '@/utils'
 
 defineOptions({ name: 'Wallet' })
 
@@ -71,6 +80,8 @@ const rechargeAmount = ref(0)
 const customAmount = ref('')
 const recharging = ref(false)
 const txList = ref<any[]>([])
+const loading = ref(false)
+const loadError = ref('')
 
 const presetAmounts = [10, 50, 100, 200, 500]
 
@@ -85,34 +96,54 @@ const finalAmount = computed(() => {
   return Number(customAmount.value) || 0
 })
 
-onMounted(async () => {
+async function loadWallet() {
+  if (loading.value) return
+  loading.value = true
+  loadError.value = ''
   try {
     const [balRes, txRes]: any[] = await Promise.all([
       getBalance(),
       getTransactions({ pageNo: 1, pageSize: 50 })
     ])
+    if (!balRes.success) throw new Error(balRes.msg || balRes.message || '余额加载失败')
+    if (!txRes.success) throw new Error(txRes.msg || txRes.message || '交易记录加载失败')
     if (balRes.data?.balance != null) balance.value = Number(balRes.data.balance).toFixed(2)
     const txData = txRes.data || txRes
     txList.value = txData.list || txData.records || []
-  } catch { /* ignore */ }
-})
+  } catch (e: any) {
+    loadError.value = e?.message || '钱包加载失败，请重试'
+  } finally {
+    loading.value = false
+  }
+}
+
+onMounted(loadWallet)
 
 async function doRecharge() {
   const amt = finalAmount.value
-  if (amt <= 0) return
+  if (amt <= 0 || recharging.value) {
+    if (amt <= 0) _notice('请输入有效的充值金额')
+    return
+  }
   recharging.value = true
   try {
     const res: any = await recharge(amt)
+    if (!res.success) throw new Error(res.msg || res.message || '充值失败')
     if (res.data?.balance != null) balance.value = Number(res.data.balance).toFixed(2)
     showRecharge.value = false
     rechargeAmount.value = 0
     customAmount.value = ''
     // refresh tx list
     const txRes: any = await getTransactions({ pageNo: 1, pageSize: 50 })
+    if (!txRes.success) throw new Error(txRes.msg || txRes.message || '交易记录刷新失败')
     const txData = txRes.data || txRes
     txList.value = txData.list || txData.records || []
-  } catch { /* ignore */ }
-  recharging.value = false
+    _notice('充值成功')
+  } catch (e: any) {
+    _notice(e?.message || '充值失败，请重试')
+  } finally {
+    recharging.value = false
+  }
 }
 </script>
 
@@ -121,6 +152,24 @@ async function doRecharge() {
   min-height: 100vh;
   background: #f5f5f5;
   color: #333;
+
+  .page-state {
+    min-height: 280rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12rem;
+    color: #777;
+
+    button {
+      border: 0;
+      border-radius: 4rem;
+      padding: 7rem 18rem;
+      color: white;
+      background: #fe2c55;
+    }
+  }
 
   .top-bar {
     position: sticky;

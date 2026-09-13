@@ -118,7 +118,6 @@ public final class RecommendationConfig {
     public static final int SOCIAL_FOLLOW_LIMIT      = 100;
     public static final int SOCIAL_RECENT_AUTHOR_LIMIT = 20;
     public static final int BACKLOG_FOLLOW_LIMIT     = 100;
-    public static final int EXPLORE_RANDOM_FACTOR     = 3;  // 分母, 实际随机度 = 0.3
 
     // ==================== 多样性限制 ====================
     public static final int MAX_PER_AUTHOR      = 2;
@@ -293,6 +292,7 @@ public final class RecommendationConfig {
     public static final int LIMIT_MAX_PHRASES       = 8;
     public static final int LIMIT_CREATOR_AFFINITY  = 50;
     public static final int LIMIT_RECENT_SEARCHES   = 10;
+    public static final int LIMIT_CATEGORY_FEEDBACK_HISTORY = 2000;
 
     // ==================== 缓存 ====================
     public static final long TRENDING_CACHE_MS      = 300_000;  // 5分钟

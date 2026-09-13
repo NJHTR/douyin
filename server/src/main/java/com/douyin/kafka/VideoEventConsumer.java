@@ -1,11 +1,10 @@
 package com.douyin.kafka;
 
-import com.douyin.entity.Like;
-import com.douyin.entity.VideoCollect;
 import com.douyin.entity.WatchHistory;
 import com.douyin.entity.Video;
 import com.douyin.kafka.dto.VideoEvent;
 import com.douyin.mapper.LikeMapper;
+import com.douyin.mapper.UserMapper;
 import com.douyin.mapper.VideoCollectMapper;
 import com.douyin.mapper.VideoMapper;
 import com.douyin.mapper.WatchHistoryMapper;
@@ -32,18 +31,20 @@ import java.time.LocalDateTime;
 public class VideoEventConsumer {
 
     private final LikeMapper likeMapper;
+    private final UserMapper userMapper;
     private final VideoMapper videoMapper;
     private final VideoCollectMapper collectMapper;
     private final WatchHistoryMapper watchHistoryMapper;
     private final RedisCacheService cache;
     private final KafkaEventLedgerService ledger;
 
-    public VideoEventConsumer(LikeMapper likeMapper, VideoMapper videoMapper,
+    public VideoEventConsumer(LikeMapper likeMapper, UserMapper userMapper, VideoMapper videoMapper,
                               VideoCollectMapper collectMapper,
                               WatchHistoryMapper watchHistoryMapper,
                               RedisCacheService cache,
                               KafkaEventLedgerService ledger) {
         this.likeMapper = likeMapper;
+        this.userMapper = userMapper;
         this.videoMapper = videoMapper;
         this.collectMapper = collectMapper;
         this.watchHistoryMapper = watchHistoryMapper;
@@ -86,44 +87,55 @@ public class VideoEventConsumer {
     }
 
     private void handleLike(VideoEvent event) {
-        Like like = new Like();
-        like.setUserId(event.getUserId());
-        like.setVideoId(event.getVideoId());
-        like.setCreateTime(LocalDateTime.now());
-        try {
-            likeMapper.insert(like);
-            videoMapper.incrementLike(event.getVideoId(), 1);
-            cache.delete("douyin:video:meta:" + event.getVideoId());
-            cache.invalidateRecommend(event.getUserId());
-        } catch (Exception e) {
-            log.warn("Like insert duplicate: userId={} videoId={}", event.getUserId(), event.getVideoId());
-        }
+        Video video = requireVideo(event.getVideoId());
+        if (likeMapper.insertIgnore(event.getUserId(), event.getVideoId()) == 0) return;
+        requireCounterUpdate(videoMapper.incrementLike(event.getVideoId(), 1), event, "like");
+        adjustAuthorFavorites(video, 1);
+        cache.delete("douyin:video:meta:" + event.getVideoId());
+        cache.invalidateRecommend(event.getUserId());
     }
 
     private void handleUnlike(VideoEvent event) {
-        likeMapper.deleteByUserAndVideo(event.getUserId(), event.getVideoId());
-        videoMapper.incrementLike(event.getVideoId(), -1);
+        Video video = requireVideo(event.getVideoId());
+        if (likeMapper.deleteByUserAndVideo(event.getUserId(), event.getVideoId()) == 0) return;
+        requireCounterUpdate(videoMapper.incrementLike(event.getVideoId(), -1), event, "like");
+        adjustAuthorFavorites(video, -1);
         cache.delete("douyin:video:meta:" + event.getVideoId());
     }
 
     private void handleCollect(VideoEvent event) {
-        VideoCollect c = new VideoCollect();
-        c.setUserId(event.getUserId());
-        c.setVideoId(event.getVideoId());
-        c.setCreateTime(LocalDateTime.now());
-        try {
-            collectMapper.insert(c);
-            videoMapper.incrementCollect(event.getVideoId(), 1);
-            cache.delete("douyin:video:meta:" + event.getVideoId());
-        } catch (Exception e) {
-            log.warn("Collect insert duplicate: userId={} videoId={}", event.getUserId(), event.getVideoId());
-        }
+        requireVideo(event.getVideoId());
+        if (collectMapper.insertIgnore(event.getUserId(), event.getVideoId()) == 0) return;
+        requireCounterUpdate(videoMapper.incrementCollect(event.getVideoId(), 1), event, "collect");
+        cache.delete("douyin:video:meta:" + event.getVideoId());
     }
 
     private void handleUncollect(VideoEvent event) {
-        collectMapper.deleteByUserAndVideo(event.getUserId(), event.getVideoId());
-        videoMapper.incrementCollect(event.getVideoId(), -1);
+        requireVideo(event.getVideoId());
+        if (collectMapper.deleteByUserAndVideo(event.getUserId(), event.getVideoId()) == 0) return;
+        requireCounterUpdate(videoMapper.incrementCollect(event.getVideoId(), -1), event, "collect");
         cache.delete("douyin:video:meta:" + event.getVideoId());
+    }
+
+    private Video requireVideo(Long videoId) {
+        Video video = videoMapper.selectById(videoId);
+        if (video == null) {
+            throw new IllegalStateException("Video not found: " + videoId);
+        }
+        return video;
+    }
+
+    private void requireCounterUpdate(int rows, VideoEvent event, String counter) {
+        if (rows != 1) {
+            throw new IllegalStateException("Unable to update " + counter
+                    + " counter for video " + event.getVideoId());
+        }
+    }
+
+    private void adjustAuthorFavorites(Video video, int delta) {
+        if (video.getAuthorUserId() != null && video.getAuthorUserId() > 0) {
+            userMapper.incrementTotalFavorited(video.getAuthorUserId(), delta);
+        }
     }
 
     private void handleWatch(VideoEvent event) {

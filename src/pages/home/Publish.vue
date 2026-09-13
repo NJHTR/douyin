@@ -717,7 +717,7 @@ async function switchCamera() {
 }
 
 function toggleFlash() {
-  _notice('闪光灯功能未实现')
+  _notice('闪光灯功能即将上线')
 }
 
 function switchMode(key: string) {
@@ -1275,15 +1275,15 @@ function insertAt() {
 }
 
 function handleLocation() {
-  _notice('添加地点功能未实现')
+  _notice('添加地点功能即将上线')
 }
 
 function handleTag() {
-  _notice('添加标签功能未实现')
+  _notice('添加标签功能即将上线')
 }
 
 function handleShare() {
-  _notice('分享功能未实现')
+  _notice('分享功能即将上线')
 }
 
 function setDaily() {

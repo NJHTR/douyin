@@ -1,11 +1,10 @@
 package com.douyin.websocket;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
-import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
-import java.io.IOException;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Set;
@@ -22,7 +21,18 @@ public class SessionManager {
 
     /** userId -> 该用户所有设备的 WebSocketSession 集合 */
     private final Map<Long, Set<WebSocketSession>> sessions = new ConcurrentHashMap<>();
+    private final WebSocketOutboundDispatcher outboundDispatcher;
     private volatile WebSocketClusterBus clusterBus;
+
+    /** Kept for small integrations/tests that construct the manager directly. */
+    public SessionManager() {
+        this(new WebSocketOutboundDispatcher(8, 4096, 256));
+    }
+
+    @Autowired
+    public SessionManager(WebSocketOutboundDispatcher outboundDispatcher) {
+        this.outboundDispatcher = outboundDispatcher;
+    }
 
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     public void setClusterBus(WebSocketClusterBus clusterBus) {
@@ -30,12 +40,14 @@ public class SessionManager {
     }
 
     public void register(Long userId, WebSocketSession session) {
+        outboundDispatcher.register(session);
         sessions.computeIfAbsent(userId, k -> new CopyOnWriteArraySet<>()).add(session);
         log.info("Session registered: userId={}, sessionId={}, deviceCount={}",
                 userId, session.getId(), sessions.get(userId).size());
     }
 
     public void unregister(Long userId, WebSocketSession session) {
+        outboundDispatcher.unregister(session);
         Set<WebSocketSession> set = sessions.get(userId);
         if (set != null) {
             set.remove(session);
@@ -51,7 +63,13 @@ public class SessionManager {
         Set<WebSocketSession> set = sessions.get(userId);
         if (set == null || set.isEmpty()) return false;
         // 清理已关闭的连接
-        set.removeIf(s -> !s.isOpen());
+        set.removeIf(session -> {
+            if (session.isOpen()) {
+                return false;
+            }
+            outboundDispatcher.unregister(session);
+            return true;
+        });
         if (set.isEmpty()) {
             sessions.remove(userId);
             return false;
@@ -74,27 +92,22 @@ public class SessionManager {
         if (set == null || set.isEmpty()) return;
         for (WebSocketSession session : set) {
             if (session.isOpen()) {
-                try {
-                    push(session, json);
-                } catch (RuntimeException e) {
-                    log.error("Push failed: userId={}, sessionId={}", userId, session.getId(), e);
+                if (!outboundDispatcher.send(session, json)) {
+                    set.remove(session);
                 }
+            } else {
+                outboundDispatcher.unregister(session);
+                set.remove(session);
             }
+        }
+        if (set.isEmpty()) {
+            sessions.remove(userId, set);
         }
     }
 
-    /** Serialize writes per socket; Spring WebSocket sessions do not allow concurrent sendMessage calls. */
+    /** Queue a write for this socket; delivery remains ordered and never blocks the caller on network I/O. */
     public void push(WebSocketSession session, String json) {
-        if (session == null || !session.isOpen()) {
-            return;
-        }
-        synchronized (session) {
-            try {
-                session.sendMessage(new TextMessage(json));
-            } catch (IOException e) {
-                throw new IllegalStateException("websocket delivery failed", e);
-            }
-        }
+        outboundDispatcher.send(session, json);
     }
 
     /** 推送 JSON 给指定用户的所有设备，同时回显给发送者的所有设备 */

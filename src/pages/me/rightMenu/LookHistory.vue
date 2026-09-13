@@ -19,7 +19,7 @@
       <SlideHorizontal v-model:index="data.currentSlideItemIndex" class="SlideHorizontal">
         <SlideItem class="tab1" style="overflow: auto">
           <Scroll class="Scroll" @pulldown="getHistoryVideo">
-            <Posters :list="data.historyVideo.list" v-if="data.historyVideo.total"></Posters>
+            <Posters :list="data.historyVideo.list" v-if="data.historyVideo.list.length"></Posters>
             <Loading :is-full-screen="false" v-if="data.loadingVideo" />
             <template v-else>
               <NoMore v-if="data.historyVideo.list.length" />
@@ -30,11 +30,18 @@
             </template>
           </Scroll>
         </SlideItem>
-        <SlideItem class="tab2">
-          <div class="empty">
-            <img src="../../../assets/img/icon/none-bg1.webp" alt="" />
-            <div class="title">暂无观影历史记录</div>
-          </div>
+        <SlideItem class="tab2" style="overflow: auto">
+          <Scroll class="Scroll" @pulldown="getHistoryOther">
+            <Posters :list="data.historyOther.list" v-if="data.historyOther.list.length"></Posters>
+            <Loading :is-full-screen="false" v-if="data.loadingOther" />
+            <template v-else>
+              <NoMore v-if="data.historyOther.list.length && !data.historyOther.hasMore" />
+              <div class="empty" v-else-if="!data.historyOther.list.length">
+                <img src="../../../assets/img/icon/none-bg1.webp" alt="" />
+                <div class="title">暂无观影历史记录</div>
+              </div>
+            </template>
+          </Scroll>
         </SlideItem>
       </SlideHorizontal>
     </div>
@@ -44,7 +51,7 @@
 import Posters from '@/components/Posters.vue'
 import Scroll from '@/components/Scroll.vue'
 import NoMore from '@/components/NoMore.vue'
-import { historyOther, historyVideo } from '@/api/videos'
+import { historyOtherCursor, historyVideoCursor } from '@/api/videos'
 
 import { computed, onMounted, reactive } from 'vue'
 import { _showConfirmDialog } from '@/utils'
@@ -61,13 +68,13 @@ const data = reactive({
   currentSlideItemIndex: 0,
   pageSize: 15,
   historyVideo: {
-    total: 0,
-    pageNo: 1,
+    nextCursor: null as string | null,
+    hasMore: true,
     list: []
   },
   historyOther: {
-    total: 0,
-    pageNo: 1,
+    nextCursor: null as string | null,
+    hasMore: true,
     list: []
   }
 })
@@ -87,37 +94,38 @@ async function getHistoryVideo(init = false) {
   if (data.loadingVideo) return
   if (data.isClearHistoryVideo) return
   if (!init) {
-    if (data.historyVideo.total <= data.historyVideo.list.length) return
-    data.historyVideo.pageNo++
+    if (!data.historyVideo.hasMore) return
   }
   data.loadingVideo = true
-  let res: any = await historyVideo({
-    pageNo: data.historyVideo.pageNo,
+  let res: any = await historyVideoCursor({
+    cursor: data.historyVideo.nextCursor,
     pageSize: data.pageSize
   })
   console.log(res)
   data.loadingVideo = false
   if (res.success) {
     data.historyVideo.list = data.historyVideo.list.concat(res.data.list)
-    data.historyVideo.total = res.data.total
+    data.historyVideo.nextCursor = res.data.nextCursor
+    data.historyVideo.hasMore = res.data.hasMore
   }
 }
 
 async function getHistoryOther(init = false) {
   if (data.loadingOther) return
   if (data.isClearHistoryOther) return
-  data.loadingOther = true
   if (!init) {
-    data.historyOther.pageNo++
+    if (!data.historyOther.hasMore) return
   }
-  let res: any = await historyOther({
-    pageNo: data.historyOther.pageNo,
+  data.loadingOther = true
+  let res: any = await historyOtherCursor({
+    cursor: data.historyOther.nextCursor,
     pageSize: data.pageSize
   })
   data.loadingOther = false
   if (res.success) {
     data.historyOther.list = data.historyOther.list.concat(res.data.list)
-    data.historyOther.total = res.data.total
+    data.historyOther.nextCursor = res.data.nextCursor
+    data.historyOther.hasMore = res.data.hasMore
   }
 }
 
@@ -129,7 +137,7 @@ function clear() {
       return
     }
     data.historyOther.list = []
-    data.isClearHistoryVideo = true
+    data.isClearHistoryOther = true
   })
 }
 </script>

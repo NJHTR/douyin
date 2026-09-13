@@ -2,7 +2,7 @@
   <div class="FaceToFace">
     <BaseHeader style="background: black">
       <template v-slot:right>
-        <span class="f16" @click="nav('/common-setting')">设置</span>
+        <span class="f16" @click="nav('/me/right-menu/setting')">设置</span>
       </template>
     </BaseHeader>
     <div class="content"></div>

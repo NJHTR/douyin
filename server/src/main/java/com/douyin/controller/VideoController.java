@@ -1,6 +1,7 @@
 package com.douyin.controller;
 
 import com.douyin.common.PageDTO;
+import com.douyin.common.CursorPageDTO;
 import com.douyin.common.Result;
 import com.douyin.entity.Comment;
 import com.douyin.entity.Notification;
@@ -13,8 +14,10 @@ import com.douyin.kafka.dto.NotificationEvent;
 import com.douyin.mapper.UserMapper;
 import com.douyin.service.CommentService;
 import com.douyin.service.ContentFeatureService;
+import com.douyin.service.FeedChannel;
 import com.douyin.service.CoverService;
 import com.douyin.service.MessageService;
+import com.douyin.service.NotificationDispatchService;
 import com.douyin.service.MusicService;
 import com.douyin.service.SystemNoticeService;
 import com.douyin.service.VideoMergeService;
@@ -48,6 +51,7 @@ public class VideoController {
     private final VideoMergeService videoMergeService;
     private final SystemNoticeService systemNoticeService;
     private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final NotificationDispatchService notificationDispatchService;
 
     public VideoController(VideoService videoService, CommentService commentService,
                            CoverService coverService, JwtUtil jwtUtil,
@@ -55,7 +59,8 @@ public class VideoController {
                            UserMapper userMapper, ContentFeatureService contentFeatureService,
                            MusicService musicService, VideoMergeService videoMergeService,
                            SystemNoticeService systemNoticeService,
-                           KafkaTemplate<String, Object> kafkaTemplate) {
+                           KafkaTemplate<String, Object> kafkaTemplate,
+                           NotificationDispatchService notificationDispatchService) {
         this.videoService = videoService;
         this.commentService = commentService;
         this.coverService = coverService;
@@ -68,6 +73,7 @@ public class VideoController {
         this.videoMergeService = videoMergeService;
         this.systemNoticeService = systemNoticeService;
         this.kafkaTemplate = kafkaTemplate;
+        this.notificationDispatchService = notificationDispatchService;
     }
 
     /** 从请求头提取当前登录用户ID, 未登录返回 null */
@@ -84,9 +90,12 @@ public class VideoController {
     public Result<PageDTO<VideoVO>> recommended(
             @RequestParam(defaultValue = "0") int start,
             @RequestParam(defaultValue = "6") int pageSize,
+            @RequestParam(name = "feedMode", required = false) String feedMode,
+            @RequestParam(name = "client_session_id", required = false) String clientSessionId,
             HttpServletRequest req) {
         Long viewerUserId = getLoginUserId(req);
-        return Result.ok(videoService.getRecommended(viewerUserId, start, pageSize, "recommend-video"));
+        return Result.ok(videoService.getRecommended(viewerUserId, Math.max(0, start), pageSize,
+                "recommend-video", FeedChannel.parse(feedMode), clientSessionId));
     }
 
     /** 长视频推荐（时长 >= 60 秒） */
@@ -94,9 +103,11 @@ public class VideoController {
     public Result<PageDTO<VideoVO>> longRecommended(
             @RequestParam(defaultValue = "1") int pageNo,
             @RequestParam(defaultValue = "10") int pageSize,
+            @RequestParam(name = "client_session_id", required = false) String clientSessionId,
             HttpServletRequest req) {
         Long viewerUserId = getLoginUserId(req);
-        return Result.ok(videoService.getRecommended(viewerUserId, (pageNo - 1) * pageSize, pageSize, "long-video"));
+        return Result.ok(videoService.getRecommended(viewerUserId, (pageNo - 1) * pageSize, pageSize,
+                "long-video", FeedChannel.LONG_VIDEO, clientSessionId));
     }
 
     /** 关注页：关注用户的视频 */
@@ -118,18 +129,26 @@ public class VideoController {
             HttpServletRequest req) {
         Long viewerUserId = getLoginUserId(req);
         int pageNo = start / pageSize + 1;
-        return Result.ok(videoService.getTrendingVideos(viewerUserId, pageNo, pageSize));
+        return Result.ok(videoService.getRecommended(viewerUserId, (pageNo - 1) * pageSize,
+                pageSize, "recommend-video", FeedChannel.HOT,
+                req.getParameter("client_session_id")));
     }
 
     /** 视频评论（分页） */
     @GetMapping("/comments")
     public Result<List<Map<String, Object>>> comments(
-            @RequestParam Long id,
-            @RequestParam(defaultValue = "1") int pageNo,
+            @RequestParam(required = false) Long id,
+            @RequestParam(name = "video_id", required = false) Long videoId,
+            @RequestParam(name = "pageNo", defaultValue = "1") int pageNo,
+            @RequestParam(name = "page", required = false) Integer page,
             @RequestParam(defaultValue = "15") int pageSize,
             HttpServletRequest req) {
+        Long resolvedId = id != null ? id : videoId;
+        if (resolvedId == null) return Result.fail("视频ID不能为空");
+        int resolvedPage = Math.max(1, page != null && page > 0 ? page : pageNo);
+        int resolvedPageSize = Math.min(100, Math.max(1, pageSize));
         Long viewerUserId = getLoginUserId(req);
-        return Result.ok(commentService.getVideoComments(id, viewerUserId, pageNo, pageSize));
+        return Result.ok(commentService.getVideoComments(resolvedId, viewerUserId, resolvedPage, resolvedPageSize));
     }
 
     /** 点赞/取消点赞评论 */
@@ -197,6 +216,16 @@ public class VideoController {
         return Result.ok(videoService.getHistory(viewerUserId, pageNo, pageSize));
     }
 
+    /** Keyset pagination; the legacy pageNo/pageSize endpoint remains supported. */
+    @GetMapping("/history/cursor")
+    public Result<CursorPageDTO<VideoVO>> historyCursor(
+            @RequestParam(required = false) String cursor,
+            @RequestParam(defaultValue = "15") int pageSize,
+            HttpServletRequest req) {
+        Long viewerUserId = getLoginUserId(req);
+        return Result.ok(videoService.getHistoryCursor(viewerUserId, cursor, pageSize));
+    }
+
     /** 其他浏览历史(影视综等) */
     @GetMapping("/historyOther")
     public Result<PageDTO<VideoVO>> historyOther(
@@ -205,6 +234,16 @@ public class VideoController {
             HttpServletRequest req) {
         Long viewerUserId = getLoginUserId(req);
         return Result.ok(videoService.getHistoryOther(viewerUserId, pageNo, pageSize));
+    }
+
+    /** Keyset pagination with film/TV category filtering performed in the database. */
+    @GetMapping("/historyOther/cursor")
+    public Result<CursorPageDTO<VideoVO>> historyOtherCursor(
+            @RequestParam(required = false) String cursor,
+            @RequestParam(defaultValue = "15") int pageSize,
+            HttpServletRequest req) {
+        Long viewerUserId = getLoginUserId(req);
+        return Result.ok(videoService.getHistoryOtherCursor(viewerUserId, cursor, pageSize));
     }
 
     /** 发布视频 (支持选配乐合成) */
@@ -520,16 +559,9 @@ public class VideoController {
         final Long fUserId = userId, fFromUserId = fromUserId, fVideoId = videoId, fCommentId = commentId;
         final Integer fType = type;
         final String fContent = content;
-        final MessagePublisher pub = messagePublisher;
-        java.util.concurrent.CompletableFuture.runAsync(() -> {
-            try {
-                pub.publishNotification(new NotificationEvent(
-                        fUserId, fFromUserId, fType, fVideoId, fCommentId, fContent, System.currentTimeMillis(), null));
-                log.info("[NOTIF] Kafka published: toUser={} type={}", fUserId, fType);
-            } catch (Exception e) {
-                log.error("[NOTIF] Kafka publish failed: toUser={} type={} error={}", fUserId, fType, e.getMessage(), e);
-            }
-        });
+        notificationDispatchService.dispatch(new NotificationEvent(
+                fUserId, fFromUserId, fType, fVideoId, fCommentId, fContent,
+                System.currentTimeMillis(), null));
     }
 
     /** 根据评论内容生成通知文案：文本优先，纯媒体则显示类型标签 */
@@ -571,33 +603,53 @@ public class VideoController {
         if (userId == null) return Result.fail("请先登录");
         Video video = videoService.getById(videoId);
         if (video == null) return Result.fail("视频不存在");
-        double watchDuration = body.get("watch_duration") != null
-                ? Double.parseDouble(body.get("watch_duration").toString()) : 0;
-        double videoDuration = body.get("video_duration") != null
-                ? Double.parseDouble(body.get("video_duration").toString()) : 0;
-        boolean finished = body.get("finished") != null && Boolean.parseBoolean(body.get("finished").toString());
-        String trafficSource = body.get("traffic_source") != null
-                ? body.get("traffic_source").toString() : "HOME_RECOMMEND";
-        String sessionId = body.get("session_id") != null
-                ? body.get("session_id").toString() : null;
-        double swipeSeconds = body.get("swipe_seconds") != null
-                ? Double.parseDouble(body.get("swipe_seconds").toString()) : watchDuration;
-        double lastPosition = body.get("last_position") != null
-                ? Double.parseDouble(body.get("last_position").toString()) : 0;
+        // Progress is reported by several clients and must never be able to
+        // inject NaN/Infinity or unbounded values into the history table.
+        double watchDuration = parseWatchMetric(body.get("watch_duration"), 86_400);
+        double videoDuration = parseWatchMetric(body.get("video_duration"), 86_400);
+        if (videoDuration <= 0 && video.getDuration() != null) {
+            videoDuration = Math.min(86_400, Math.max(0, video.getDuration()));
+        }
+        boolean finished = Boolean.parseBoolean(String.valueOf(body.getOrDefault("finished", false)));
+        boolean profileSample = finished
+                || Boolean.parseBoolean(String.valueOf(body.getOrDefault("profile_sample", false)));
+        String trafficSource = normalizeWatchText(body.get("traffic_source"), 32, "HOME_RECOMMEND");
+        String sessionId = normalizeWatchText(body.get("session_id"), 64, null);
+        double swipeSeconds = body.containsKey("swipe_seconds")
+                ? parseWatchMetric(body.get("swipe_seconds"), 86_400) : watchDuration;
+        double lastPosition = parseWatchMetric(body.get("last_position"),
+                videoDuration > 0 ? videoDuration : 86_400);
 
         videoService.recordWatch(userId, videoId, video.getAuthorUserId(),
                 watchDuration, videoDuration, finished,
                 trafficSource, sessionId, swipeSeconds, lastPosition);
 
-        // 更新全行为画像
-        try {
-            contentFeatureService.onWatch(userId, videoId, video.getAuthorUserId(),
+        // Derived profile work is bounded and asynchronous; the durable
+        // history upsert above remains on the request path.
+        if (profileSample) {
+            contentFeatureService.onWatchAsync(userId, videoId, video.getAuthorUserId(),
                     watchDuration, videoDuration, trafficSource, sessionId, swipeSeconds);
-        } catch (Exception e) {
-            log.warn("画像更新失败: userId={} videoId={}", userId, videoId, e);
         }
 
         return Result.ok();
+    }
+
+    private static double parseWatchMetric(Object raw, double max) {
+        if (raw == null) return 0;
+        try {
+            double value = Double.parseDouble(raw.toString());
+            if (!Double.isFinite(value) || value <= 0) return 0;
+            return Math.min(value, max);
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
+    }
+
+    private static String normalizeWatchText(Object raw, int maxLength, String fallback) {
+        if (raw == null) return fallback;
+        String value = raw.toString().trim();
+        if (value.isEmpty()) return fallback;
+        return value.length() <= maxLength ? value : value.substring(0, maxLength);
     }
 
     /** 搜索视频 */

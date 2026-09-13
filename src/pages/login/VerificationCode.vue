@@ -68,12 +68,19 @@ async function login() {
     const res = await loginByEmail(target, data.code)
     if (res.success) {
       store.token = res.data.token
-      store.isLoggedIn = true
+      store.isLoggedIn = false
+      store.profileLoaded = false
       localStorage.setItem('token', res.data.token)
       localStorage.setItem('login_email', target)
       const p = await panel()
       if (p.success) {
         store.setUserinfo(p.data)
+        store.isLoggedIn = true
+        store.profileLoaded = true
+        localStorage.setItem('role', store.userinfo.role || 'user')
+      } else if (Number(p.code) === 401) {
+        store.token = ''
+        localStorage.removeItem('token')
       }
       router.replace('/me')
     } else {

@@ -1,0 +1,8 @@
+UI SFX audio assets
+Source: https://github.com/romainsimon/uisfx
+License: Creative Commons CC0 1.0 Universal Public Domain Dedication
+
+These procedurally generated audio files may be copied, modified, distributed,
+and used commercially without permission. Attribution is appreciated but not
+required. This notice applies to the files in the soft directory vendored by
+this project and not to any upstream generated/provider-backed artifacts.

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nivo://ai/schemas/search-summarizer-input/v1",
+  "title": "NIVO Search Summarizer input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["query", "results"],
+  "properties": {
+    "query": {"type": "string", "minLength": 1, "maxLength": 200},
+    "results": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/result"}}
+  },
+  "$defs": {
+    "result": {
+      "type": "object", "additionalProperties": false,
+      "required": ["result_id", "title"],
+      "properties": {
+        "result_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "title": {"type": "string", "minLength": 1, "maxLength": 160},
+        "category": {"type": "string", "maxLength": 40},
+        "topics": {"type": "array", "maxItems": 8, "items": {"type": "string", "maxLength": 40}},
+        "location": {"type": "array", "maxItems": 4, "items": {"type": "string", "maxLength": 40}},
+        "engagement": {"type": "object", "additionalProperties": false, "properties": {"likes": {"type": "integer", "minimum": 0}, "plays": {"type": "integer", "minimum": 0}}}
+      }
+    }
+  }
+}

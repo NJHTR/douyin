@@ -72,45 +72,30 @@ axiosInstance.interceptors.response.use(
     }
   },
   (error: AxiosError) => {
-    console.log('error', error)
-    // console.log(error.response)
-    // console.log(error.response.status)
-    if (error.response === undefined) {
-      _notice('服务器响应超时')
-      return { success: false, code: 500, msg: '服务器响应超时', data: [] }
-    }
-    if (error.response.status >= 500) {
-      _notice('服务器出现错误')
-      return { success: false, code: 500, msg: '服务器出现错误', data: [] }
-    }
-    if (error.response.status === 404) {
-      _notice('接口不存在')
-      return { success: false, code: 404, msg: '接口不存在', data: [] }
-    }
-    if (error.response.status === 400) {
-      _notice('接口报错')
-      return { success: false, code: 400, msg: '接口报错', data: [] }
-    }
-    if (error.response.status === 401) {
-      return { success: false, code: 401, msg: '用户名或密码不正确', data: [] }
-      } else {
-        const data: any = error.response.data
-      if (data === null || data === undefined) {
-        _notice('请求失败，请稍后重试！')
-        return { success: true, code: 200, data: [] }
-      } else {
-        const resCode = data.code
-        if (data.data === undefined || data.data === null) {
-          data.data = { ...data }
-        }
-        if (resCode && typeof resCode == 'number' && resCode !== 200) {
-          _notice(data.msg || data.message || '请求失败，请稍后重试！')
-        } else {
-          data.code = 200
-          data.success = true
-        }
-        return data
-      }
+    const status = error.response?.status || 0
+    const payload: any = error.response?.data
+    const defaultMessage = status >= 500
+      ? '服务器出现错误'
+      : status === 404
+        ? '接口不存在'
+        : status === 401
+          ? '登录状态已失效'
+          : status === 403
+            ? '没有操作权限'
+            : status === 429
+              ? '操作过于频繁，请稍后重试'
+              : status === 0
+                ? '服务器响应超时'
+                : '请求失败，请稍后重试！'
+    const message = payload?.msg || payload?.message || defaultMessage
+
+    if (status !== 401) _notice(message)
+    return {
+      success: false,
+      code: Number(payload?.code) || status || 500,
+      msg: message,
+      message,
+      data: payload?.data ?? []
     }
   }
 )
@@ -118,6 +103,10 @@ axiosInstance.interceptors.response.use(
 export interface ApiResponse<T = any> {
   data: T
   success: boolean
+  code?: number
+  msg?: string
+  message?: string
+  count?: number
 }
 
 export async function request<T = any>(config: AxiosRequestConfig): Promise<ApiResponse<T>> {
@@ -130,9 +119,22 @@ export async function request<T = any>(config: AxiosRequestConfig): Promise<ApiR
     .then((res: any) => {
       const success = res.success === true
       const innerData = res.data !== undefined ? res.data : res
-      return { success, data: innerData } as const
+      return {
+        success,
+        data: innerData,
+        code: res.code,
+        msg: res.msg,
+        message: res.message,
+        count: res.count
+      } as ApiResponse<T>
     })
     .catch((err) => {
-      return { success: false, data: err } as const
+      return {
+        success: false,
+        code: 500,
+        msg: err?.message || '请求失败，请稍后重试！',
+        message: err?.message || '请求失败，请稍后重试！',
+        data: err
+      } as ApiResponse<T>
     })
 }

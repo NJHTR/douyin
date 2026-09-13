@@ -9,10 +9,120 @@ export type FeedbackKind =
   | 'friend'
   | 'call'
 
+/** Semantic sound tokens. Business code must use these tokens instead of files. */
+export type SoundEvent =
+  | 'ui.tap' | 'ui.selection' | 'ui.success' | 'ui.warning' | 'ui.error' | 'ui.confirm' | 'ui.cancel'
+  | 'navigation.push' | 'navigation.pop' | 'sheet.open' | 'sheet.close'
+  | 'message.received' | 'message.sent' | 'message.failed' | 'message.retry'
+  | 'like' | 'follow' | 'favorite'
+  | 'upload.start' | 'upload.progress' | 'upload.complete' | 'upload.failed'
+  | 'call.incoming' | 'call.ringing' | 'call.connecting' | 'call.connected'
+  | 'call.reconnecting' | 'call.rejected' | 'call.busy' | 'call.timeout' | 'call.ended' | 'call.failed'
+  | 'notification.important' | 'notification.normal' | 'notification.background'
+
+export type SoundPriority = 0 | 1 | 2 | 3 | 4 | 5
+
+export interface SoundContext {
+  /** Suppress notification feedback while the corresponding conversation is open. */
+  isCurrentConversation?: boolean
+  /** Background events are silent unless explicitly important. */
+  isBackground?: boolean
+  /** Stable id used for event-level deduplication. */
+  eventId?: string
+  /** Override the default cooldown for a single semantic event. */
+  cooldownMs?: number
+}
+
+export interface SoundPolicy {
+  kind: FeedbackKind
+  priority: SoundPriority
+  volume: number
+  cooldownMs: number
+  interruptible: boolean
+  dedupe: boolean
+  haptic: boolean
+}
+
+export const SOUND_POLICY: Record<SoundEvent, SoundPolicy> = {
+  'ui.tap': { kind: 'like', priority: 5, volume: 0.16, cooldownMs: 120, interruptible: true, dedupe: true, haptic: false },
+  'ui.selection': { kind: 'like', priority: 5, volume: 0.12, cooldownMs: 120, interruptible: true, dedupe: true, haptic: true },
+  'ui.success': { kind: 'friend', priority: 3, volume: 0.32, cooldownMs: 250, interruptible: true, dedupe: true, haptic: true },
+  'ui.warning': { kind: 'mention', priority: 2, volume: 0.28, cooldownMs: 350, interruptible: true, dedupe: true, haptic: true },
+  'ui.error': { kind: 'comment', priority: 2, volume: 0.3, cooldownMs: 350, interruptible: true, dedupe: true, haptic: true },
+  'ui.confirm': { kind: 'friend', priority: 3, volume: 0.28, cooldownMs: 250, interruptible: true, dedupe: true, haptic: true },
+  'ui.cancel': { kind: 'comment', priority: 4, volume: 0.2, cooldownMs: 180, interruptible: true, dedupe: true, haptic: false },
+  'navigation.push': { kind: 'like', priority: 5, volume: 0.1, cooldownMs: 180, interruptible: true, dedupe: true, haptic: false },
+  'navigation.pop': { kind: 'like', priority: 5, volume: 0.1, cooldownMs: 180, interruptible: true, dedupe: true, haptic: false },
+  'sheet.open': { kind: 'like', priority: 5, volume: 0.1, cooldownMs: 180, interruptible: true, dedupe: true, haptic: false },
+  'sheet.close': { kind: 'like', priority: 5, volume: 0.1, cooldownMs: 180, interruptible: true, dedupe: true, haptic: false },
+  'message.received': { kind: 'chat', priority: 1, volume: 0.42, cooldownMs: 650, interruptible: true, dedupe: true, haptic: true },
+  'message.sent': { kind: 'like', priority: 5, volume: 0.14, cooldownMs: 250, interruptible: true, dedupe: true, haptic: false },
+  'message.failed': { kind: 'comment', priority: 2, volume: 0.3, cooldownMs: 400, interruptible: true, dedupe: true, haptic: true },
+  'message.retry': { kind: 'mention', priority: 3, volume: 0.22, cooldownMs: 400, interruptible: true, dedupe: true, haptic: false },
+  like: { kind: 'like', priority: 4, volume: 0.18, cooldownMs: 220, interruptible: true, dedupe: true, haptic: true },
+  follow: { kind: 'follow', priority: 4, volume: 0.24, cooldownMs: 300, interruptible: true, dedupe: true, haptic: true },
+  favorite: { kind: 'collect', priority: 4, volume: 0.22, cooldownMs: 300, interruptible: true, dedupe: true, haptic: true },
+  'upload.start': { kind: 'like', priority: 4, volume: 0.16, cooldownMs: 250, interruptible: true, dedupe: true, haptic: false },
+  'upload.progress': { kind: 'like', priority: 5, volume: 0.08, cooldownMs: 800, interruptible: true, dedupe: true, haptic: false },
+  'upload.complete': { kind: 'friend', priority: 3, volume: 0.32, cooldownMs: 300, interruptible: true, dedupe: true, haptic: true },
+  'upload.failed': { kind: 'comment', priority: 2, volume: 0.3, cooldownMs: 400, interruptible: true, dedupe: true, haptic: true },
+  'call.incoming': { kind: 'call', priority: 0, volume: 0.75, cooldownMs: 900, interruptible: false, dedupe: true, haptic: true },
+  'call.ringing': { kind: 'call', priority: 0, volume: 0.7, cooldownMs: 1200, interruptible: false, dedupe: true, haptic: true },
+  'call.connecting': { kind: 'mention', priority: 1, volume: 0.34, cooldownMs: 300, interruptible: true, dedupe: true, haptic: true },
+  'call.connected': { kind: 'friend', priority: 1, volume: 0.4, cooldownMs: 500, interruptible: true, dedupe: true, haptic: true },
+  'call.reconnecting': { kind: 'mention', priority: 1, volume: 0.3, cooldownMs: 1200, interruptible: true, dedupe: true, haptic: true },
+  'call.rejected': { kind: 'comment', priority: 1, volume: 0.3, cooldownMs: 500, interruptible: true, dedupe: true, haptic: true },
+  'call.busy': { kind: 'comment', priority: 1, volume: 0.3, cooldownMs: 500, interruptible: true, dedupe: true, haptic: true },
+  'call.timeout': { kind: 'comment', priority: 1, volume: 0.3, cooldownMs: 500, interruptible: true, dedupe: true, haptic: true },
+  'call.ended': { kind: 'comment', priority: 1, volume: 0.26, cooldownMs: 500, interruptible: true, dedupe: true, haptic: true },
+  'call.failed': { kind: 'comment', priority: 1, volume: 0.3, cooldownMs: 500, interruptible: true, dedupe: true, haptic: true },
+  'notification.important': { kind: 'mention', priority: 1, volume: 0.46, cooldownMs: 650, interruptible: true, dedupe: true, haptic: true },
+  'notification.normal': { kind: 'comment', priority: 3, volume: 0.28, cooldownMs: 900, interruptible: true, dedupe: true, haptic: true },
+  'notification.background': { kind: 'comment', priority: 5, volume: 0.14, cooldownMs: 1500, interruptible: true, dedupe: true, haptic: false }
+}
+
+const SOUND_PACK: Partial<Record<SoundEvent, string>> = {
+  'ui.tap': '/sounds/uisfx/soft/notification.mp3',
+  'ui.selection': '/sounds/uisfx/soft/notification.mp3',
+  'ui.success': '/sounds/uisfx/soft/success.mp3',
+  'ui.warning': '/sounds/uisfx/soft/warning.mp3',
+  'ui.error': '/sounds/uisfx/soft/error.mp3',
+  'ui.confirm': '/sounds/uisfx/soft/success.mp3',
+  'ui.cancel': '/sounds/uisfx/soft/cancel.mp3',
+  'navigation.push': '/sounds/uisfx/soft/connect.mp3',
+  'navigation.pop': '/sounds/uisfx/soft/cancel.mp3',
+  'sheet.open': '/sounds/uisfx/soft/connect.mp3',
+  'sheet.close': '/sounds/uisfx/soft/cancel.mp3',
+  'message.received': '/sounds/uisfx/soft/receive.mp3',
+  'message.sent': '/sounds/uisfx/soft/send.mp3',
+  'message.failed': '/sounds/uisfx/soft/error.mp3',
+  'message.retry': '/sounds/uisfx/soft/connecting.mp3',
+  like: '/sounds/uisfx/soft/notification.mp3',
+  follow: '/sounds/uisfx/soft/success.mp3',
+  favorite: '/sounds/uisfx/soft/complete.mp3',
+  'upload.start': '/sounds/uisfx/soft/connecting.mp3',
+  'upload.progress': '/sounds/uisfx/soft/notification.mp3',
+  'upload.complete': '/sounds/uisfx/soft/complete.mp3',
+  'upload.failed': '/sounds/uisfx/soft/error.mp3',
+  'call.incoming': '/sounds/uisfx/soft/notification.mp3',
+  'call.ringing': '/sounds/uisfx/soft/notification.mp3',
+  'call.connecting': '/sounds/uisfx/soft/connecting.mp3',
+  'call.connected': '/sounds/uisfx/soft/connect.mp3',
+  'call.reconnecting': '/sounds/uisfx/soft/connecting.mp3',
+  'call.rejected': '/sounds/uisfx/soft/cancel.mp3',
+  'call.busy': '/sounds/uisfx/soft/warning.mp3',
+  'call.timeout': '/sounds/uisfx/soft/warning.mp3',
+  'call.ended': '/sounds/uisfx/soft/cancel.mp3',
+  'call.failed': '/sounds/uisfx/soft/error.mp3',
+  'notification.important': '/sounds/uisfx/soft/notification.mp3',
+  'notification.normal': '/sounds/uisfx/soft/notification.mp3'
+}
+
 export interface NotificationFeedbackSettings {
   enabled: boolean
   soundEnabled: boolean
   vibrationEnabled: boolean
+  reducedFeedback: boolean
   volume: number
   soundUrls: Partial<Record<FeedbackKind, string>>
   vibrationPatterns: Partial<Record<FeedbackKind, number[]>>
@@ -36,12 +146,16 @@ let audioContext: AudioContext | null = null
 let audioUnlocked = false
 let unlockInstalled = false
 let callRingtoneTimer: ReturnType<typeof setInterval> | null = null
+let callRingtoneGeneration = 0
+const lastPlayedAt = new Map<string, number>()
+const activeAudio = new Set<HTMLAudioElement>()
 
 function readSettings(): NotificationFeedbackSettings {
   const defaults: NotificationFeedbackSettings = {
     enabled: true,
     soundEnabled: true,
     vibrationEnabled: true,
+    reducedFeedback: false,
     volume: 0.55,
     soundUrls: {},
     vibrationPatterns: {}
@@ -81,6 +195,27 @@ export function updateNotificationFeedbackSettings(
   settings = { ...settings, ...patch }
   persist()
   return getNotificationFeedbackSettings()
+}
+
+/** Runtime snapshot of the semantic policy, useful to debug product feedback. */
+export function getSoundPolicy(event: SoundEvent): SoundPolicy {
+  return SOUND_POLICY[event]
+}
+
+function shouldSuppress(event: SoundEvent, context: SoundContext, policy: SoundPolicy): boolean {
+  if (context.isCurrentConversation && event === 'message.received') return true
+  if (context.isBackground && event === 'notification.background') return true
+  const now = Date.now()
+  const key = context.eventId ? `${event}:${context.eventId}` : event
+  const last = lastPlayedAt.get(key)
+  const cooldown = context.cooldownMs ?? policy.cooldownMs
+  if (policy.dedupe && last !== undefined && now - last < cooldown) return true
+  lastPlayedAt.set(key, now)
+  if (lastPlayedAt.size > 200) {
+    const oldest = lastPlayedAt.keys().next().value
+    if (oldest) lastPlayedAt.delete(oldest)
+  }
+  return false
 }
 
 export function resetNotificationFeedbackSettings() {
@@ -264,23 +399,66 @@ async function playDefaultTone(kind: FeedbackKind) {
   }
 }
 
-async function playCustomSound(url: string) {
+async function playCustomSound(url: string, volume = settings.volume): Promise<boolean> {
   const audio = new Audio(url)
-  audio.volume = settings.volume
-  await audio.play().catch(() => {})
+  audio.volume = volume
+  activeAudio.add(audio)
+  audio.addEventListener('ended', () => activeAudio.delete(audio), { once: true })
+  return audio.play().then(() => true).catch(() => {
+    activeAudio.delete(audio)
+    return false
+  })
+}
+
+/**
+ * The only public sound entry point for product interactions. It owns policy,
+ * deduplication, volume hierarchy, haptic pairing and accessibility suppression.
+ */
+export async function playSound(event: SoundEvent, context: SoundContext = {}): Promise<boolean> {
+  const policy = SOUND_POLICY[event]
+  if (!policy || !settings.enabled || settings.reducedFeedback) return false
+  if (shouldSuppress(event, context, policy)) return false
+  if (settings.soundEnabled) {
+    const customUrl = settings.soundUrls[policy.kind] || SOUND_PACK[event]
+    if (customUrl) {
+      const played = await playCustomSound(customUrl, Math.min(1, settings.volume * policy.volume / 0.42))
+      if (!played) {
+        const contextAudio = getAudioContext()
+        if (contextAudio) {
+          const previousVolume = settings.volume
+          settings.volume = Math.min(1, previousVolume * policy.volume / 0.42)
+          await playDefaultTone(policy.kind)
+          settings.volume = previousVolume
+        }
+      }
+    } else {
+      const contextAudio = getAudioContext()
+      if (contextAudio) {
+        const previousVolume = settings.volume
+        settings.volume = Math.min(1, previousVolume * policy.volume / 0.42)
+        await playDefaultTone(policy.kind)
+        settings.volume = previousVolume
+      }
+    }
+  }
+  if (policy.haptic && settings.vibrationEnabled && typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+    const pattern = settings.vibrationPatterns[policy.kind] || DEFAULT_PATTERNS[policy.kind] || DEFAULT_PATTERN
+    navigator.vibrate(settings.reducedFeedback ? pattern.slice(0, 1) : pattern)
+  }
+  return true
+}
+
+/** Namespaced aliases keep call sites expressive while retaining one policy owner. */
+export const sound = { play: playSound }
+export const interaction = {
+  feedback: (input: { event: SoundEvent; context?: SoundContext }) => playSound(input.event, input.context)
 }
 
 export async function playNotificationFeedback(kind: FeedbackKind) {
-  if (!settings.enabled) return
-  if (settings.soundEnabled) {
-    const customUrl = settings.soundUrls[kind]
-    if (customUrl) await playCustomSound(customUrl)
-    else await playDefaultTone(kind)
-  }
-  if (settings.vibrationEnabled && typeof navigator !== 'undefined' && 'vibrate' in navigator) {
-    const pattern = settings.vibrationPatterns[kind] || DEFAULT_PATTERNS[kind] || DEFAULT_PATTERN
-    navigator.vibrate(pattern)
-  }
+  const event: SoundEvent = kind === 'chat' || kind === 'group' ? 'message.received' :
+    kind === 'follow' ? 'follow' : kind === 'like' ? 'like' : kind === 'collect' ? 'favorite' :
+      kind === 'call' ? 'call.ringing' : 'notification.normal'
+  return playSound(event, { cooldownMs: SOUND_POLICY[event].cooldownMs })
 }
 
 /**
@@ -289,20 +467,52 @@ export async function playNotificationFeedback(kind: FeedbackKind) {
  */
 export function startCallRingtone(intervalMs = 1800) {
   stopCallRingtone()
+  const generation = ++callRingtoneGeneration
   const tick = () => {
-    void playNotificationFeedback('call')
+    if (generation !== callRingtoneGeneration) return
+    void playSound('call.ringing', { eventId: `ring-${generation}` })
   }
   tick()
   callRingtoneTimer = setInterval(tick, intervalMs)
 }
 
 export function stopCallRingtone() {
+  callRingtoneGeneration++
   if (callRingtoneTimer) {
     clearInterval(callRingtoneTimer)
     callRingtoneTimer = null
   }
   if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
     navigator.vibrate(0)
+  }
+}
+
+export function stopAllSound() {
+  stopCallRingtone()
+  activeAudio.forEach((audio) => {
+    audio.pause()
+    audio.currentTime = 0
+  })
+  activeAudio.clear()
+  if (audioContext?.state === 'running') void audioContext.suspend().catch(() => {})
+}
+
+export function installSoundLifecycle(): () => void {
+  if (typeof window === 'undefined') return () => {}
+  const onVisibility = () => {
+    if (document.visibilityState !== 'visible') {
+      // Long-lived ringing must never leak into a background route/tab.
+      if (callRingtoneTimer) stopCallRingtone()
+      activeAudio.forEach((audio) => audio.pause())
+    }
+  }
+  const onPageHide = () => stopAllSound()
+  document.addEventListener('visibilitychange', onVisibility)
+  window.addEventListener('pagehide', onPageHide)
+  return () => {
+    document.removeEventListener('visibilitychange', onVisibility)
+    window.removeEventListener('pagehide', onPageHide)
+    stopAllSound()
   }
 }
 

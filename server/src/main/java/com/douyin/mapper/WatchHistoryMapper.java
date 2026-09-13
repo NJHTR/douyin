@@ -2,16 +2,109 @@ package com.douyin.mapper;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import com.douyin.entity.WatchHistory;
+import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 
+import java.util.Collection;
 import java.util.List;
+import java.time.LocalDateTime;
 
 public interface WatchHistoryMapper extends BaseMapper<WatchHistory> {
+
+    /**
+     * Record progress without a read-before-write race.  The unique
+     * (user_id, video_id) key serializes concurrent reports and the monotonic
+     * fields prevent an older packet from moving progress backwards.
+     */
+    @Insert("""
+            INSERT INTO t_watch_history
+                (user_id, video_id, author_user_id, watch_duration, video_duration,
+                 finished, repeat_count, traffic_source, session_id, swipe_seconds, last_position)
+            VALUES
+                (#{userId}, #{videoId}, #{authorUserId}, #{watchDuration}, #{videoDuration},
+                 #{finished}, 1, #{trafficSource}, #{sessionId}, #{swipeSeconds}, #{lastPosition})
+            ON DUPLICATE KEY UPDATE
+                author_user_id = COALESCE(VALUES(author_user_id), author_user_id),
+                watch_duration = GREATEST(COALESCE(watch_duration, 0), COALESCE(VALUES(watch_duration), 0)),
+                video_duration = CASE
+                    WHEN COALESCE(VALUES(video_duration), 0) > 0 THEN VALUES(video_duration)
+                    ELSE video_duration
+                END,
+                finished = GREATEST(COALESCE(finished, 0), COALESCE(VALUES(finished), 0)),
+                repeat_count = COALESCE(repeat_count, 1) + CASE
+                    WHEN NULLIF(VALUES(session_id), '') IS NOT NULL
+                         AND (session_id IS NULL OR session_id <> VALUES(session_id))
+                    THEN 1 ELSE 0
+                END,
+                traffic_source = COALESCE(NULLIF(VALUES(traffic_source), ''), traffic_source),
+                session_id = COALESCE(NULLIF(VALUES(session_id), ''), session_id),
+                swipe_seconds = GREATEST(COALESCE(swipe_seconds, 0), COALESCE(VALUES(swipe_seconds), 0)),
+                last_position = GREATEST(COALESCE(last_position, 0), COALESCE(VALUES(last_position), 0))
+            """)
+    int upsertProgress(@Param("userId") Long userId,
+                       @Param("videoId") Long videoId,
+                       @Param("authorUserId") Long authorUserId,
+                       @Param("watchDuration") double watchDuration,
+                       @Param("videoDuration") double videoDuration,
+                       @Param("finished") int finished,
+                       @Param("trafficSource") String trafficSource,
+                       @Param("sessionId") String sessionId,
+                       @Param("swipeSeconds") double swipeSeconds,
+                       @Param("lastPosition") double lastPosition);
 
     /** 获取用户观看历史视频ID，按最近观看时间排序 */
     @Select("SELECT video_id FROM t_watch_history WHERE user_id = #{userId} ORDER BY update_time DESC LIMIT #{offset}, #{limit}")
     List<Long> findHistoryVideoIds(@Param("userId") Long userId, @Param("offset") int offset, @Param("limit") int limit);
+
+    /** Fetch one extra row so the service can determine hasMore without COUNT/OFFSET. */
+    @Select("<script>SELECT h.id, h.user_id, h.video_id, h.author_user_id, h.watch_duration, h.video_duration, " +
+            "h.finished, h.repeat_count, h.traffic_source, h.session_id, h.swipe_seconds, h.last_position, " +
+            "h.create_time, h.update_time FROM t_watch_history h " +
+            "INNER JOIN t_video v ON v.id = h.video_id AND v.status = 'APPROVED' AND v.is_delete = 0 " +
+            "WHERE h.user_id = #{userId} " +
+            "<if test='cursorTime != null and cursorId != null'>" +
+            "AND (h.update_time &lt; #{cursorTime} OR (h.update_time = #{cursorTime} AND h.id &lt; #{cursorId})) " +
+            "</if>" +
+            "ORDER BY h.update_time DESC, h.id DESC LIMIT #{limit}</script>")
+    List<WatchHistory> findHistoryCursor(@Param("userId") Long userId,
+                                         @Param("cursorTime") LocalDateTime cursorTime,
+                                         @Param("cursorId") Long cursorId,
+                                         @Param("limit") int limit);
+
+    /** Database-filtered film/TV history with the same stable cursor boundary. */
+    @Select("<script>SELECT h.id, h.user_id, h.video_id, h.author_user_id, h.watch_duration, h.video_duration, " +
+            "h.finished, h.repeat_count, h.traffic_source, h.session_id, h.swipe_seconds, h.last_position, " +
+            "h.create_time, h.update_time FROM t_watch_history h " +
+            "INNER JOIN t_video v ON v.id = h.video_id AND v.status = 'APPROVED' AND v.is_delete = 0 " +
+            "INNER JOIN t_video_content c ON c.video_id = h.video_id " +
+            "WHERE h.user_id = #{userId} " +
+            "AND c.text_category IN " +
+            "<foreach collection='categories' item='category' open='(' separator=',' close=')'>#{category}</foreach> " +
+            "<if test='cursorTime != null and cursorId != null'>" +
+            "AND (h.update_time &lt; #{cursorTime} OR (h.update_time = #{cursorTime} AND h.id &lt; #{cursorId})) " +
+            "</if>" +
+            "ORDER BY h.update_time DESC, h.id DESC LIMIT #{limit}</script>")
+    List<WatchHistory> findHistoryOtherCursor(@Param("userId") Long userId,
+                                              @Param("categories") Collection<String> categories,
+                                              @Param("cursorTime") LocalDateTime cursorTime,
+                                              @Param("cursorId") Long cursorId,
+                                              @Param("limit") int limit);
+
+    @Select("SELECT video_id FROM t_watch_history WHERE user_id = #{userId} " +
+            "AND update_time >= #{since} AND finished = 1 " +
+            "ORDER BY update_time DESC, id DESC LIMIT #{limit}")
+    List<Long> findRecentFinishedVideoIds(@Param("userId") Long userId,
+                                          @Param("since") LocalDateTime since,
+                                          @Param("limit") int limit);
+
+    /** Bounded recent watch signals used to calculate per-category feedback. */
+    @Select("SELECT video_id, watch_duration, video_duration, swipe_seconds " +
+            "FROM t_watch_history WHERE user_id = #{userId} AND update_time >= #{since} " +
+            "ORDER BY update_time DESC, id DESC LIMIT #{limit}")
+    List<WatchHistory> findRecentCategoryFeedback(@Param("userId") Long userId,
+                                                   @Param("since") LocalDateTime since,
+                                                   @Param("limit") int limit);
 
     /** 批量统计候选视频的近期观看人次 */
     @Select("<script>SELECT video_id, COUNT(*) as cnt FROM t_watch_history " +
@@ -24,7 +117,7 @@ public interface WatchHistoryMapper extends BaseMapper<WatchHistory> {
     /** 用户近期快速划走的视频ID (用于品类负反馈) */
     @Select("SELECT video_id FROM t_watch_history " +
             "WHERE user_id = #{userId} AND swipe_seconds < #{maxSwipeSeconds} " +
-            "AND create_time >= #{since}")
+            "AND update_time >= #{since}")
     List<Long> findQuickSkipVideoIds(@Param("userId") Long userId,
                                       @Param("maxSwipeSeconds") double maxSwipeSeconds,
                                       @Param("since") java.time.LocalDateTime since);

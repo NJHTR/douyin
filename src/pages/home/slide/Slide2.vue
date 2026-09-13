@@ -5,6 +5,7 @@
       uniqueId="follow"
       :style="{ background: 'black' }"
       :api="followingVideos"
+      :request-params="{ feedMode: 'FOLLOWING' }"
     />
   </SlideItem>
 </template>

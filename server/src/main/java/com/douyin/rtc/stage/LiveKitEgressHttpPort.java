@@ -2,9 +2,9 @@ package com.douyin.rtc.stage;
 
 import com.douyin.rtc.provider.RtcProperties;
 import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.SignatureAlgorithm;
 import io.jsonwebtoken.security.Keys;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -39,6 +39,7 @@ public class LiveKitEgressHttpPort implements StageProviderPort {
     private final RtcProperties rtcProperties;
     private final RestTemplate restTemplate;
 
+    @Autowired
     public LiveKitEgressHttpPort(StageProperties stageProperties, RtcProperties rtcProperties) {
         this.stageProperties = stageProperties;
         this.rtcProperties = rtcProperties;
@@ -89,7 +90,7 @@ public class LiveKitEgressHttpPort implements StageProviderPort {
         } catch (StageProviderException e) {
             throw e;
         } catch (RestClientResponseException e) {
-            throw new StageProviderException("Egress 调用失败: " + url + " http=" + e.getRawStatusCode(), e);
+            throw new StageProviderException("Egress 调用失败: " + url + " http=" + e.getStatusCode().value(), e);
         } catch (Exception e) {
             throw new StageProviderException("Egress 调用失败: " + url + " (" + e.getClass().getSimpleName() + ")", e);
         }
@@ -137,7 +138,7 @@ public class LiveKitEgressHttpPort implements StageProviderPort {
                 .header()
                 .keyId(apiKey)
                 .and()
-                .signWith(key, SignatureAlgorithm.HS256)
+                .signWith(key, Jwts.SIG.HS256)
                 .compact();
     }
 }

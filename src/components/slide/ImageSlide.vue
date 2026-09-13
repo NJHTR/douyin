@@ -50,10 +50,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, provide } from 'vue'
+import { computed, onMounted, onUnmounted, ref, provide, watch } from 'vue'
 import { _checkImgUrl } from '@/utils'
-import { toggleVideoLike, recordWatch } from '@/api/videos'
+import { toggleVideoLike } from '@/api/videos'
 import { getBrowsingSessionId } from '@/utils/session'
+import { queueRecommendationWatch } from '@/utils/recommendationTelemetryClient'
+import { trafficSourceForFeed } from '@/utils/recommendation'
 import { useBaseStore } from '@/store/pinia'
 import bus, { EVENT_KEY } from '@/utils/bus'
 import ItemToolbar from './ItemToolbar.vue'
@@ -108,31 +110,55 @@ const videoId = computed(() => props.item?.aweme_id)
 const authorUserId = computed(() => String(props.item?.author?.uid || ''))
 let watchSec = 0
 let watchTimer: ReturnType<typeof setInterval> | null = null
+let lastReportedSec = -1
+let lastProfileSampleSec = -1
 
-function sendWatchProgress(finished = false) {
+function sendWatchProgress(finished = false, profileSample = false) {
   if (!store.userinfo?.uid || !videoId.value) return
   if (String(store.userinfo.uid) === authorUserId.value) return
-  recordWatch(videoId.value, {
+  if (watchSec <= 0) return
+  if (profileSample && watchSec === lastProfileSampleSec) return
+  if (!finished && !profileSample && watchSec === lastReportedSec) return
+  queueRecommendationWatch(videoId.value, {
     watch_duration: watchSec,
     video_duration: 0,
     finished,
     session_id: getBrowsingSessionId(),
     swipe_seconds: watchSec,
-    traffic_source: 'HOME_RECOMMEND'
-  }).catch(() => {})
+    traffic_source: trafficSourceForFeed(props.position?.uniqueId),
+    profile_sample: profileSample || finished
+  })
+  lastReportedSec = watchSec
+  if (profileSample || finished) lastProfileSampleSec = watchSec
 }
 
-onMounted(() => {
-  sendWatchProgress(false)
+function startWatchTimer() {
+  if (watchTimer) return
   watchTimer = setInterval(() => {
     watchSec++
-    if (watchSec > 0 && watchSec % 5 === 0) sendWatchProgress()
+    if (watchSec % 15 === 0) sendWatchProgress()
   }, 1000)
+}
+
+function stopWatchTimer(flush = true) {
+  if (watchTimer) clearInterval(watchTimer)
+  watchTimer = null
+  if (flush) sendWatchProgress(false, true)
+}
+
+watch(
+  () => props.isPlay,
+  (active) => (active ? startWatchTimer() : stopWatchTimer()),
+  { immediate: true }
+)
+
+onMounted(() => {
+  if (props.isPlay) startWatchTimer()
 })
 
 onUnmounted(() => {
-  if (watchTimer) clearInterval(watchTimer)
-  sendWatchProgress(true)
+  stopWatchTimer(false)
+  sendWatchProgress(watchSec >= 5, true)
   watchSec = 0
 })
 

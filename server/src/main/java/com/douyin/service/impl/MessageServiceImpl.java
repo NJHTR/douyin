@@ -6,6 +6,7 @@ import com.douyin.entity.Message;
 import com.douyin.entity.Notification;
 import com.douyin.entity.User;
 import com.douyin.mapper.MessageMapper;
+import com.douyin.mapper.ConversationSummaryRow;
 import com.douyin.mapper.NotificationMapper;
 import com.douyin.service.MessageService;
 import com.douyin.service.UserService;
@@ -74,65 +75,26 @@ public class MessageServiceImpl extends ServiceImpl<MessageMapper, Message> impl
 
     @Override
     public List<ConversationVO> getConversations(Long userId) {
-        // 找到所有与我有消息往来的用户(读取最近100条消息提取)
-        LambdaQueryWrapper<Message> recent = new LambdaQueryWrapper<>();
-        recent.and(w -> w
-                .eq(Message::getFromUserId, userId)
-                .or()
-                .eq(Message::getToUserId, userId));
-        recent.select(Message::getFromUserId, Message::getToUserId);
-        recent.orderByDesc(Message::getId);
-        recent.last("LIMIT 200");
-        List<Message> recentMessages = list(recent);
+        List<ConversationSummaryRow> rows = baseMapper.selectConversationSummaries(userId, 200);
+        if (rows.isEmpty()) return List.of();
 
-        Set<Long> targetIds = new HashSet<>();
-        for (Message m : recentMessages) {
-            if (m.getFromUserId().equals(userId)) {
-                targetIds.add(m.getToUserId());
-            } else {
-                targetIds.add(m.getFromUserId());
-            }
-        }
+        Set<Long> targetIds = rows.stream()
+                .map(ConversationSummaryRow::getTargetUserId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+        Map<Long, UserVO> userMap = getUserVOMap(targetIds);
 
-        if (targetIds.isEmpty()) return List.of();
-
-        List<ConversationVO> result = new ArrayList<>();
-        for (Long targetId : targetIds) {
-            // 查该对话最后一条消息
-            LambdaQueryWrapper<Message> lastMsg = new LambdaQueryWrapper<>();
-            lastMsg.and(w -> w
-                    .and(w1 -> w1.eq(Message::getFromUserId, userId).eq(Message::getToUserId, targetId))
-                    .or(w1 -> w1.eq(Message::getFromUserId, targetId).eq(Message::getToUserId, userId)));
-            lastMsg.orderByDesc(Message::getId);
-            lastMsg.last("LIMIT 1");
-            Message last = getOne(lastMsg);
-
-            // 未读数
-            long unread = count(new LambdaQueryWrapper<Message>()
-                    .eq(Message::getFromUserId, targetId)
-                    .eq(Message::getToUserId, userId)
-                    .eq(Message::getIsRead, 0));
-
-            User user = userService.getById(targetId);
-            UserVO targetVO = user != null ? UserVO.from(user) : null;
-
+        return rows.stream().map(row -> {
             ConversationVO vo = new ConversationVO();
-            vo.setTargetUser(targetVO);
-            vo.setLastMessage(last != null ? last.getContent() : "");
-            vo.setLastMsgType(last != null ? last.getMsgType() : 1);
-            vo.setLastTime(last != null ? last.getCreateTime() : null);
-            vo.setUnreadCount(unread);
-            vo.setLastMsgFromUserId(last != null ? last.getFromUserId() : null);
-            vo.setLastMsgIsRead(last != null ? last.getIsRead() : null);
-            result.add(vo);
-        }
-
-        result.sort((a, b) -> {
-            if (a.getLastTime() == null) return 1;
-            if (b.getLastTime() == null) return -1;
-            return b.getLastTime().compareTo(a.getLastTime());
-        });
-        return result;
+            vo.setTargetUser(userMap.get(row.getTargetUserId()));
+            vo.setLastMessage(row.getLastMessage() != null ? row.getLastMessage() : "");
+            vo.setLastMsgType(row.getLastMsgType() != null ? row.getLastMsgType() : 1);
+            vo.setLastTime(row.getLastTime());
+            vo.setUnreadCount(row.getUnreadCount() != null ? row.getUnreadCount() : 0L);
+            vo.setLastMsgFromUserId(row.getLastMsgFromUserId());
+            vo.setLastMsgIsRead(row.getLastMsgIsRead());
+            return vo;
+        }).toList();
     }
 
     @Override

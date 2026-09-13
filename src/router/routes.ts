@@ -5,7 +5,17 @@ import type { RouteRecordRaw } from 'vue-router'
 
 const routes: RouteRecordRaw[] = [
   // {path: '/', redirect: '/attention'},
-  { path: '/', redirect: '/home' },
+  { path: '/', component: Home },
+  // Desktop Douyin-style channel URLs. The shell keeps these routes inside the shared layout.
+  { path: '/jingxuan', component: Home },
+  { path: '/aisearch', component: () => import('@/pages/home/DesktopChannelPage.vue') },
+  { path: '/follow', component: () => import('@/pages/home/DesktopChannelPage.vue') },
+  { path: '/friend', component: () => import('@/pages/home/DesktopChannelPage.vue') },
+  { path: '/user/self', component: () => import('@/pages/me/Me.vue') },
+  { path: '/live', component: () => import('@/pages/live/LiveList.vue') },
+  { path: '/vs', component: () => import('@/pages/home/DesktopChannelPage.vue') },
+  { path: '/series', component: () => import('@/pages/home/DesktopChannelPage.vue') },
+  { path: '/microgame', component: () => import('@/pages/home/DesktopChannelPage.vue') },
   { path: '/test', component: Test },
   { path: '/test4', component: Test4 },
 
@@ -145,6 +155,10 @@ const routes: RouteRecordRaw[] = [
   },
   {
     path: '/message/more-search',
+    component: () => import('@/pages/message/MoreSearch.vue')
+  },
+  {
+    path: '/message/add-friend',
     component: () => import('@/pages/message/MoreSearch.vue')
   },
   {

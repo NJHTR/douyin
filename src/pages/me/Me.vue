@@ -147,7 +147,7 @@
                   </div>
                 </div>
                 <div class="other">
-                  <div class="item" @click="_no">
+                  <div class="item" @click="$nav('/shop')">
                     <Icon icon="iconamoon:shopping-card-light" />
                     <span>SeekFlow商城</span>
                   </div>

@@ -22,6 +22,12 @@ const props = defineProps({
     default() {
       return () => void 0
     }
+  },
+  apiParams: {
+    type: Object,
+    default() {
+      return {}
+    }
   }
 })
 const scroll = useScroll()
@@ -49,6 +55,7 @@ async function getData(refresh = false) {
   if (state.loading) return
   state.loading = true
   let res = await props.api({
+    ...props.apiParams,
     pageNo: state.pageNo,
     pageSize: state.pageSize
   })

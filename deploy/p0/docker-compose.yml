@@ -1,0 +1,89 @@
+# P0 local acceptance topology.
+# The API replicas share externally managed MySQL, Redis and Kafka. Set all
+# connection values in .env; do not put credentials in this file.
+services:
+  api-a:
+    image: ${API_IMAGE:-douyin-p0-api:local}
+    build:
+      context: ../..
+      dockerfile: server/Dockerfile
+    restart: "no"
+    init: true
+    ports:
+      - "${API_A_PORT:-9191}:9191"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:--Duser.timezone=Asia/Shanghai -Xms256m -Xmx768m -XX:+UseG1GC}
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-dev}
+      SERVER_PORT: 9191
+      DB_URL: ${DB_URL:?set DB_URL}
+      DB_USERNAME: ${DB_USERNAME:?set DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+      REDIS_HOST: ${REDIS_HOST:?set REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:?set KAFKA_BOOTSTRAP_SERVERS}
+      DOUYIN_KAFKA_ENABLED: ${DOUYIN_KAFKA_ENABLED:-true}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      MINIO_ENABLED: ${MINIO_ENABLED:-false}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://host.docker.internal:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-}
+      RTC_NODE_ID: ${RTC_NODE_ID_A:-p0-api-a}
+      WEBSOCKET_CLUSTER_ENABLED: ${WEBSOCKET_CLUSTER_ENABLED:-true}
+      WEBSOCKET_CLUSTER_CHANNEL: ${WEBSOCKET_CLUSTER_CHANNEL:-douyin:websocket:fanout:v1}
+      WEBSOCKET_LIVE_CLUSTER_CHANNEL: ${WEBSOCKET_LIVE_CLUSTER_CHANNEL:-douyin:websocket:live-fanout:v1}
+      WEBSOCKET_ALLOWED_ORIGINS: ${WEBSOCKET_ALLOWED_ORIGINS:-http://localhost:3000}
+      RTC_CALL_RINGING_TTL: ${RTC_CALL_RINGING_TTL:-180s}
+      RTC_CALL_HISTORY_RETENTION: ${RTC_CALL_HISTORY_RETENTION:-31d}
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9191'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 35s
+
+  api-b:
+    image: ${API_IMAGE:-douyin-p0-api:local}
+    build:
+      context: ../..
+      dockerfile: server/Dockerfile
+    restart: "no"
+    init: true
+    ports:
+      - "${API_B_PORT:-9192}:9191"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:--Duser.timezone=Asia/Shanghai -Xms256m -Xmx768m -XX:+UseG1GC}
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-dev}
+      SERVER_PORT: 9191
+      DB_URL: ${DB_URL:?set DB_URL}
+      DB_USERNAME: ${DB_USERNAME:?set DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+      REDIS_HOST: ${REDIS_HOST:?set REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:?set KAFKA_BOOTSTRAP_SERVERS}
+      DOUYIN_KAFKA_ENABLED: ${DOUYIN_KAFKA_ENABLED:-true}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      MINIO_ENABLED: ${MINIO_ENABLED:-false}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://host.docker.internal:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-}
+      RTC_NODE_ID: ${RTC_NODE_ID_B:-p0-api-b}
+      WEBSOCKET_CLUSTER_ENABLED: ${WEBSOCKET_CLUSTER_ENABLED:-true}
+      WEBSOCKET_CLUSTER_CHANNEL: ${WEBSOCKET_CLUSTER_CHANNEL:-douyin:websocket:fanout:v1}
+      WEBSOCKET_LIVE_CLUSTER_CHANNEL: ${WEBSOCKET_LIVE_CLUSTER_CHANNEL:-douyin:websocket:live-fanout:v1}
+      WEBSOCKET_ALLOWED_ORIGINS: ${WEBSOCKET_ALLOWED_ORIGINS:-http://localhost:3000}
+      RTC_CALL_RINGING_TTL: ${RTC_CALL_RINGING_TTL:-180s}
+      RTC_CALL_HISTORY_RETENTION: ${RTC_CALL_HISTORY_RETENTION:-31d}
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9191'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 35s
+
+networks:
+  default:
+    name: douyin-p0

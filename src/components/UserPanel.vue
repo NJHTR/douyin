@@ -35,7 +35,12 @@
           </div>
         </transition>
         <Icon class="icon" icon="ion:search" @click.stop="_no" />
-        <Icon class="icon" icon="ri:more-line" @click.stop="emit('showFollowSetting')" />
+        <Icon
+          v-if="showOverflowMenu"
+          class="icon"
+          icon="ri:more-line"
+          @click.stop="emit('showFollowSetting')"
+        />
       </div>
     </div>
     <div
@@ -269,6 +274,10 @@ const emit = defineEmits<{
 }>()
 
 const props = defineProps({
+  showOverflowMenu: {
+    type: Boolean,
+    default: true
+  },
   currentItem: {
     type: Object,
     default() {

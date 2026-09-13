@@ -71,7 +71,7 @@
             <div class="right"></div>
           </div>
           <div class="content">
-            <div class="item" @click="_no">
+            <div class="item" @click="nav('/me/wallet')">
               <Icon icon="ion:wallet-outline" />
               <span>我的钱包</span>
             </div>
@@ -83,7 +83,7 @@
               <Icon icon="icon-park-outline:bytedance-applets" />
               <span>小程序</span>
             </div>
-            <div class="item" @click="_no">
+            <div class="item" @click="nav('/me/right-menu/look-history')">
               <Icon icon="solar:history-linear" />
               <span>观看历史</span>
             </div>
@@ -95,7 +95,7 @@
               <Icon icon="iconoir:cloud-download" />
               <span>离线模式</span>
             </div>
-            <div class="item" @click="_no">
+            <div class="item" @click="nav('/me/right-menu/setting')">
               <Icon icon="ep:setting" />
               <span>设置</span>
             </div>

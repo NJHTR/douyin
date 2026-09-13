@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.douyin.common.PageDTO;
+import com.douyin.common.CursorPageDTO;
 import com.douyin.entity.Follow;
 import com.douyin.entity.Like;
 import com.douyin.entity.User;
@@ -20,15 +21,21 @@ import com.douyin.mapper.VideoContentMapper;
 import com.douyin.mapper.VideoMapper;
 import com.douyin.mapper.WatchHistoryMapper;
 import com.douyin.service.ContentFeatureService;
+import com.douyin.service.FeedChannel;
+import com.douyin.service.RecommendationConfig;
 import com.douyin.service.RecommendationEngine;
+import com.douyin.service.RedisCacheService;
 import com.douyin.service.SearchService;
 import com.douyin.service.VideoService;
 import com.douyin.vo.UserVO;
 import com.douyin.vo.VideoVO;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -45,6 +52,12 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
     private final ContentFeatureService contentFeatureService;
     private final VideoContentMapper videoContentMapper;
     private final SearchService searchService;
+    private final RedisCacheService redisCacheService;
+    private static final long LOCAL_RECOMMEND_POOL_TTL_MS = 5 * 60_000L;
+    /** Hard bound for the per-JVM acceleration cache; Redis remains the shared source. */
+    private static final int MAX_LOCAL_RECOMMEND_POOLS = 1000;
+    private final LinkedHashMap<String, LocalRecommendationPool> localRecommendationPools =
+            new LinkedHashMap<>();
 
     private static final Set<String> FILM_TV_CATEGORIES = Set.of(
             "影视", "综艺", "电影", "电视剧", "纪录片", "动漫", "娱乐");
@@ -55,6 +68,18 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
                             ContentFeatureService contentFeatureService,
                             VideoContentMapper videoContentMapper,
                             SearchService searchService) {
+        this(userMapper, likeMapper, followMapper, collectMapper, watchHistoryMapper,
+                recommendationEngine, contentFeatureService, videoContentMapper, searchService, null);
+    }
+
+    /** Spring constructor; the shorter constructor remains for isolated unit tests. */
+    @Autowired
+    public VideoServiceImpl(UserMapper userMapper, LikeMapper likeMapper, FollowMapper followMapper,
+                            VideoCollectMapper collectMapper, WatchHistoryMapper watchHistoryMapper,
+                            RecommendationEngine recommendationEngine,
+                            ContentFeatureService contentFeatureService,
+                            VideoContentMapper videoContentMapper,
+                            SearchService searchService, RedisCacheService redisCacheService) {
         this.userMapper = userMapper;
         this.likeMapper = likeMapper;
         this.followMapper = followMapper;
@@ -64,44 +89,190 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
         this.contentFeatureService = contentFeatureService;
         this.videoContentMapper = videoContentMapper;
         this.searchService = searchService;
+        this.redisCacheService = redisCacheService;
     }
 
     @Override
     public PageDTO<VideoVO> getRecommended(Long viewerUserId, int start, int pageSize, String type) {
-        Double minDuration = "long-video".equals(type) ? 60.0 : null;
+        return getRecommended(viewerUserId, start, pageSize, type, FeedChannel.HOME);
+    }
 
-        if (viewerUserId != null && start == 0) {
-            // 首页个性化推荐
-            List<Long> rankedIds = recommendationEngine.recommend(viewerUserId,
-                    pageSize * 2, minDuration);
+    @Override
+    public PageDTO<VideoVO> getRecommended(Long viewerUserId, int start, int pageSize,
+                                           String type, FeedChannel channel) {
+        return getRecommended(viewerUserId, start, pageSize, type, channel, null);
+    }
+
+    @Override
+    public PageDTO<VideoVO> getRecommended(Long viewerUserId, int start, int pageSize,
+                                           String type, FeedChannel channel, String clientSessionId) {
+        int safeStart = Math.max(0, start);
+        int safePageSize = Math.min(100, Math.max(1, pageSize));
+        FeedChannel effectiveChannel = channel == null ? FeedChannel.HOME : channel;
+        // LONG_VIDEO is a channel contract, so callers using the generic
+        // recommendation endpoint must receive the same duration filtering
+        // as the dedicated /video/long/recommended route.
+        Double minDuration = "long-video".equals(type) || effectiveChannel == FeedChannel.LONG_VIDEO
+                ? 60.0 : null;
+
+        if (effectiveChannel == FeedChannel.FOLLOWING) {
+            return getFollowingVideos(viewerUserId, safeStart / safePageSize + 1, safePageSize);
+        }
+
+        // Explicit channels never silently fall through to the generic
+        // latest-videos query.  Each request asks the engine for one bounded
+        // page; exposure exclusion advances the user's feed for the next page.
+        if ((viewerUserId != null && (effectiveChannel.isPersonalized()
+                || effectiveChannel == FeedChannel.FRIENDS || effectiveChannel.isGlobal()))
+                || effectiveChannel == FeedChannel.HOT) {
+            // Build a bounded pool, not just the currently requested page. A
+            // page-sized pool would make the next request (start > 0) observe
+            // a cached list that is too short and return an empty page.
+            int poolSize = RecommendationConfig.CANDIDATE_POOL_SIZE;
+            List<Long> rankedIds = getOrBuildRecommendationPool(viewerUserId, effectiveChannel,
+                    clientSessionId, minDuration, poolSize);
             if (!rankedIds.isEmpty()) {
-                List<Video> videos = listByIds(rankedIds.subList(0, Math.min(pageSize, rankedIds.size())));
+                List<Video> videos = listByIds(rankedIds);
                 videos = videos.stream()
                         .filter(v -> "APPROVED".equals(v.getStatus()))
                         .filter(v -> List.of("recommend-video", "image", "text").contains(v.getType()))
-                        .filter(v -> v.getDuration() != null)
+                        .filter(v -> minDuration == null
+                                || (v.getDuration() != null && v.getDuration() >= minDuration))
                         .toList();
                 // 恢复排序
                 Map<Long, Video> videoMap = videos.stream()
                         .collect(Collectors.toMap(Video::getId, v -> v));
                 List<Video> ordered = rankedIds.stream()
-                        .map(videoMap::get).filter(Objects::nonNull).limit(pageSize).toList();
-                List<VideoVO> voList = toVideoVOList(ordered, viewerUserId);
-                return new PageDTO<>((long) rankedIds.size(), 1, pageSize, voList);
+                        .map(videoMap::get).filter(Objects::nonNull).toList();
+                int from = Math.min(safeStart, ordered.size());
+                int to = Math.min(from + safePageSize, ordered.size());
+                List<Video> slice = from < to ? ordered.subList(from, to) : List.of();
+                List<VideoVO> voList = toVideoVOList(slice, viewerUserId);
+                if (!slice.isEmpty()) {
+                    recommendationEngine.recordExposures(viewerUserId,
+                            slice.stream().map(Video::getId).toList());
+                }
+                return new PageDTO<>((long) rankedIds.size(), safeStart / safePageSize + 1,
+                        safePageSize, voList);
             }
         }
 
-        // 非首页 / 未登录 / 引擎无结果 → 简单时间排序兜底
+        if (effectiveChannel == FeedChannel.FRIENDS || effectiveChannel == FeedChannel.LIVE) {
+            return new PageDTO<>(0L, safeStart / safePageSize + 1, safePageSize, List.of());
+        }
+
+        // Personalized failure degradation: use the global hot index before
+        // falling back to chronological newest content.
+        if (effectiveChannel.isPersonalized()) {
+            PageDTO<VideoVO> hotFallback = getHotFallback(viewerUserId, safeStart,
+                    safePageSize, minDuration);
+            if (!hotFallback.getList().isEmpty()) return hotFallback;
+        }
+
+        // FOLLOWING/Friends/Live/anonymous/engine-empty fallback.  Keep the
+        // fallback bounded and mode-aware instead of returning an unbounded
+        // newest slice for every channel.
         LambdaQueryWrapper<Video> wrapper = new LambdaQueryWrapper<Video>()
                 .in(Video::getType, List.of("recommend-video", "image", "text"))
                 .eq(Video::getStatus, "APPROVED")
-                .orderByDesc(Video::getCreateTime);
+                .orderByDesc(Video::getCreateTime)
+                .orderByDesc(Video::getId);
         if (minDuration != null) wrapper.ge(Video::getDuration, minDuration);
-        int pageNo = start / pageSize + 1;
-        IPage<Video> page = page(new Page<>(pageNo, pageSize), wrapper);
+        int pageNo = safeStart / safePageSize + 1;
+        IPage<Video> page = page(new Page<>(pageNo, safePageSize), wrapper);
         List<VideoVO> voList = toVideoVOList(page.getRecords(), viewerUserId);
-        return new PageDTO<>(page.getTotal(), pageNo, pageSize, voList);
+        return new PageDTO<>(page.getTotal(), pageNo, safePageSize, voList);
     }
+
+    private PageDTO<VideoVO> getHotFallback(Long viewerUserId, int start, int pageSize,
+                                            Double minDuration) {
+        LambdaQueryWrapper<Video> hotWrapper = new LambdaQueryWrapper<Video>()
+                .in(Video::getType, List.of("recommend-video", "image", "text"))
+                .eq(Video::getStatus, "APPROVED")
+                .ge(Video::getCreateTime, LocalDateTime.now().minusDays(7))
+                .orderByDesc(Video::getLikeCount)
+                .orderByDesc(Video::getCreateTime)
+                .orderByDesc(Video::getId)
+                .last("LIMIT 200");
+        if (minDuration != null) hotWrapper.ge(Video::getDuration, minDuration);
+        List<Video> candidates = new ArrayList<>(list(hotWrapper));
+        long now = System.currentTimeMillis();
+        candidates.sort(Comparator
+                .comparingDouble((Video video) -> hotScore(video, now)).reversed()
+                .thenComparing(Video::getId,
+                        Comparator.nullsLast(Comparator.reverseOrder())));
+        int from = Math.min(start, candidates.size());
+        int to = Math.min(from + pageSize, candidates.size());
+        List<Video> slice = from < to ? candidates.subList(from, to) : List.of();
+        return new PageDTO<>((long) candidates.size(), start / pageSize + 1,
+                pageSize, toVideoVOList(slice, viewerUserId));
+    }
+
+    private List<Long> getOrBuildRecommendationPool(Long userId, FeedChannel channel,
+                                                     String clientSessionId, Double minDuration,
+                                                     int poolSize) {
+        String localKey = userId + ":" + channel.name() + ":" +
+                (clientSessionId == null ? "legacy" : clientSessionId);
+        long now = System.currentTimeMillis();
+        LocalRecommendationPool local = getLocalRecommendationPool(localKey, now);
+        if (local != null && !local.videoIds().isEmpty()) {
+            return local.videoIds();
+        }
+        if (redisCacheService != null) {
+            Optional<List<Long>> cached = redisCacheService.getRecommendPool(userId, channel, clientSessionId);
+            if (cached.isPresent() && !cached.get().isEmpty()) {
+                cacheLocalRecommendationPool(localKey, now, cached.get());
+                return cached.get();
+            }
+        }
+        try {
+            List<Long> built = recommendationEngine.recommendPool(userId, poolSize,
+                    minDuration, channel);
+            if (redisCacheService != null && !built.isEmpty()) {
+                redisCacheService.putRecommendPool(userId, channel, clientSessionId, built);
+            }
+            if (!built.isEmpty()) {
+                cacheLocalRecommendationPool(localKey, now, built);
+            }
+            return built;
+        } catch (RuntimeException e) {
+            log.warn("recommendation pool failed: userId={} channel={} error={}",
+                    userId, channel, e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Keep the local cache bounded even when all sessions are active. The
+     * cache is only an optimization: an eviction can always be repopulated
+     * from the shared Redis pool (or rebuilt by the recommendation engine).
+     */
+    private synchronized LocalRecommendationPool getLocalRecommendationPool(String key, long now) {
+        LocalRecommendationPool local = localRecommendationPools.get(key);
+        if (local != null && now - local.createdAt() >= LOCAL_RECOMMEND_POOL_TTL_MS) {
+            localRecommendationPools.remove(key);
+            return null;
+        }
+        return local;
+    }
+
+    private synchronized void cacheLocalRecommendationPool(String key, long now, List<Long> videoIds) {
+        // Reinsert an existing key so insertion order continues to match the
+        // pool's latest creation time.
+        localRecommendationPools.remove(key);
+        localRecommendationPools.put(key, new LocalRecommendationPool(now, videoIds));
+        localRecommendationPools.entrySet().removeIf(entry ->
+                now - entry.getValue().createdAt() >= LOCAL_RECOMMEND_POOL_TTL_MS);
+        while (localRecommendationPools.size() > MAX_LOCAL_RECOMMEND_POOLS) {
+            Iterator<Map.Entry<String, LocalRecommendationPool>> iterator =
+                    localRecommendationPools.entrySet().iterator();
+            if (!iterator.hasNext()) break;
+            iterator.next();
+            iterator.remove();
+        }
+    }
+
+    private record LocalRecommendationPool(long createdAt, List<Long> videoIds) {}
 
     @Override
     public PageDTO<VideoVO> getFollowingVideos(Long viewerUserId, int pageNo, int pageSize) {
@@ -118,12 +289,15 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
                 .in(Video::getType, List.of("recommend-video", "image", "text"))
                 .eq(Video::getStatus, "APPROVED")
                 .orderByDesc(Video::getCreateTime)
+                .orderByDesc(Video::getId)
                 .last("LIMIT 200");
-        List<Video> candidates = list(wrapper);
+        List<Video> candidates = new ArrayList<>(list(wrapper));
         // 综合分 = 时间衰减 + 互动量加成
         long now = System.currentTimeMillis();
-        candidates.sort((a, b) -> Double.compare(
-                followingScore(b, now), followingScore(a, now)));
+        candidates.sort(Comparator
+                .comparingDouble((Video video) -> followingScore(video, now)).reversed()
+                .thenComparing(Video::getId,
+                        Comparator.nullsLast(Comparator.reverseOrder())));
         int start = (pageNo - 1) * pageSize;
         int end = Math.min(start + pageSize, candidates.size());
         List<VideoVO> voList = toVideoVOList(
@@ -145,26 +319,6 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
 
     @Override
     public PageDTO<VideoVO> getTrendingVideos(Long viewerUserId, int pageNo, int pageSize) {
-        // 登录用户首页：走推荐引擎，偏重热度信号
-        if (viewerUserId != null && pageNo == 1) {
-            List<Long> rankedIds = recommendationEngine.recommend(viewerUserId,
-                    pageSize * 2, null);
-            if (!rankedIds.isEmpty()) {
-                List<Video> videos = listByIds(rankedIds.subList(0, Math.min(pageSize, rankedIds.size())));
-                videos = videos.stream()
-                        .filter(v -> "APPROVED".equals(v.getStatus()))
-                        .filter(v -> List.of("recommend-video", "image", "text").contains(v.getType()))
-                        .filter(v -> v.getDuration() != null)
-                        .toList();
-                Map<Long, Video> videoMap = videos.stream()
-                        .collect(Collectors.toMap(Video::getId, v -> v));
-                List<Video> ordered = rankedIds.stream()
-                        .map(videoMap::get).filter(Objects::nonNull).limit(pageSize).toList();
-                List<VideoVO> voList = toVideoVOList(ordered, viewerUserId);
-                return new PageDTO<>((long) rankedIds.size(), 1, pageSize, voList);
-            }
-        }
-
         // 兜底: 热度分排序 (like_count + recency 衰减)
         LambdaQueryWrapper<Video> wrapper = new LambdaQueryWrapper<Video>()
                 .in(Video::getType, List.of("recommend-video", "image", "text"))
@@ -172,11 +326,15 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
                 .ge(Video::getCreateTime, java.time.LocalDateTime.now().minusDays(7))
                 .orderByDesc(Video::getLikeCount)
                 .orderByDesc(Video::getCreateTime)
+                .orderByDesc(Video::getId)
                 .last("LIMIT 200");
-        List<Video> candidates = list(wrapper);
+        List<Video> candidates = new ArrayList<>(list(wrapper));
         // 热度分 = like_count × 时间衰减 (48h 半衰期)
         long now = System.currentTimeMillis();
-        candidates.sort((a, b) -> Double.compare(hotScore(b, now), hotScore(a, now)));
+        candidates.sort(Comparator
+                .comparingDouble((Video video) -> hotScore(video, now)).reversed()
+                .thenComparing(Video::getId,
+                        Comparator.nullsLast(Comparator.reverseOrder())));
         int start = (pageNo - 1) * pageSize;
         int end = Math.min(start + pageSize, candidates.size());
         List<VideoVO> voList = toVideoVOList(
@@ -268,6 +426,54 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
     }
 
     @Override
+    public CursorPageDTO<VideoVO> getHistoryCursor(Long viewerUserId, String cursor, int pageSize) {
+        if (viewerUserId == null) return new CursorPageDTO<>(List.of(), null, false);
+        int safeSize = Math.min(100, Math.max(1, pageSize));
+        CursorPosition position = decodeHistoryCursor(cursor);
+        List<WatchHistory> rows = watchHistoryMapper.findHistoryCursor(
+                viewerUserId,
+                position == null ? null : position.updateTime(),
+                position == null ? null : position.id(),
+                safeSize + 1);
+        boolean hasMore = rows.size() > safeSize;
+        List<WatchHistory> pageRows = hasMore ? rows.subList(0, safeSize) : rows;
+        if (pageRows.isEmpty()) return new CursorPageDTO<>(List.of(), null, false);
+
+        List<Long> videoIds = pageRows.stream().map(WatchHistory::getVideoId).toList();
+        Map<Long, Video> videoMap = listByIds(videoIds).stream()
+                .filter(v -> "APPROVED".equals(v.getStatus()))
+                .collect(Collectors.toMap(Video::getId, v -> v, (a, b) -> a));
+        List<Video> ordered = videoIds.stream().map(videoMap::get).filter(Objects::nonNull).toList();
+        String nextCursor = hasMore
+                ? encodeHistoryCursor(pageRows.get(pageRows.size() - 1))
+                : null;
+        return new CursorPageDTO<>(toVideoVOList(ordered, viewerUserId), nextCursor, hasMore);
+    }
+
+    private static String encodeHistoryCursor(WatchHistory row) {
+        if (row.getUpdateTime() == null || row.getId() == null) return null;
+        String raw = row.getUpdateTime().toString() + "|" + row.getId();
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static CursorPosition decodeHistoryCursor(String cursor) {
+        if (cursor == null || cursor.isBlank()) return null;
+        try {
+            String raw = new String(Base64.getUrlDecoder().decode(cursor), StandardCharsets.UTF_8);
+            int separator = raw.lastIndexOf('|');
+            if (separator <= 0 || separator == raw.length() - 1) throw new IllegalArgumentException();
+            LocalDateTime updateTime = LocalDateTime.parse(raw.substring(0, separator));
+            long id = Long.parseLong(raw.substring(separator + 1));
+            if (id <= 0) throw new IllegalArgumentException();
+            return new CursorPosition(updateTime, id);
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException("观看历史游标无效");
+        }
+    }
+
+    private record CursorPosition(LocalDateTime updateTime, Long id) {}
+
+    @Override
     public PageDTO<VideoVO> getHistoryOther(Long viewerUserId, int pageNo, int pageSize) {
         if (viewerUserId == null) return new PageDTO<>(0, pageNo, pageSize, List.of());
 
@@ -305,6 +511,32 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
     }
 
     @Override
+    public CursorPageDTO<VideoVO> getHistoryOtherCursor(Long viewerUserId, String cursor, int pageSize) {
+        if (viewerUserId == null) return new CursorPageDTO<>(List.of(), null, false);
+        int safeSize = Math.min(100, Math.max(1, pageSize));
+        CursorPosition position = decodeHistoryCursor(cursor);
+        List<WatchHistory> rows = watchHistoryMapper.findHistoryOtherCursor(
+                viewerUserId,
+                FILM_TV_CATEGORIES,
+                position == null ? null : position.updateTime(),
+                position == null ? null : position.id(),
+                safeSize + 1);
+        boolean hasMore = rows.size() > safeSize;
+        List<WatchHistory> pageRows = hasMore ? rows.subList(0, safeSize) : rows;
+        if (pageRows.isEmpty()) return new CursorPageDTO<>(List.of(), null, false);
+
+        List<Long> videoIds = pageRows.stream().map(WatchHistory::getVideoId).toList();
+        Map<Long, Video> videoMap = listByIds(videoIds).stream()
+                .filter(v -> "APPROVED".equals(v.getStatus()))
+                .collect(Collectors.toMap(Video::getId, v -> v, (a, b) -> a));
+        List<Video> ordered = videoIds.stream().map(videoMap::get).filter(Objects::nonNull).toList();
+        String nextCursor = hasMore
+                ? encodeHistoryCursor(pageRows.get(pageRows.size() - 1))
+                : null;
+        return new CursorPageDTO<>(toVideoVOList(ordered, viewerUserId), nextCursor, hasMore);
+    }
+
+    @Override
     public PageDTO<VideoVO> getRecommendedPosts(Long viewerUserId, int pageNo, int pageSize) {
         if (viewerUserId != null && pageNo == 1) {
             // 首页：走推荐引擎，然后仅保留 image/text 类型
@@ -334,7 +566,8 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
         LambdaQueryWrapper<Video> wrapper = new LambdaQueryWrapper<Video>()
                 .in(Video::getType, List.of("image", "text"))
                 .eq(Video::getStatus, "APPROVED")
-                .orderByDesc(Video::getCreateTime);
+                .orderByDesc(Video::getCreateTime)
+                .orderByDesc(Video::getId);
         IPage<Video> page = page(new Page<>(pageNo, pageSize), wrapper);
         List<VideoVO> voList = toVideoVOList(page.getRecords(), viewerUserId);
         return new PageDTO<>(page.getTotal(), pageNo, pageSize, voList);
@@ -346,7 +579,8 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
         Page<Video> page = page(new Page<>(pageNo, pageSize),
                 new LambdaQueryWrapper<Video>()
                         .eq(Video::getStatus, "APPROVED")
-                        .orderByDesc(Video::getLikeCount));
+                        .orderByDesc(Video::getLikeCount)
+                        .orderByDesc(Video::getId));
         return new PageDTO<>(page.getTotal(), pageNo, pageSize,
                 toVideoVOList(page.getRecords(), null));
     }
@@ -407,46 +641,57 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
     }
 
     @Override
+    @Transactional
     public boolean toggleLike(Long userId, Long videoId) {
-        try {
-            LambdaQueryWrapper<Like> wrapper = new LambdaQueryWrapper<Like>()
-                    .eq(Like::getUserId, userId)
-                    .eq(Like::getVideoId, videoId);
-            Like exist = likeMapper.selectOne(wrapper);
-            Video video = getById(videoId);
-            if (video == null) return false;
-            if (exist != null) {
-                likeMapper.deleteById(exist.getId());
-                video.setLikeCount(Math.max(0, (video.getLikeCount() != null ? video.getLikeCount() : 0) - 1));
-                updateById(video);
-                updateAuthorFavorited(video.getAuthorUserId(), -1);
-                return false;
-            }
-            Like like = new Like();
-            like.setUserId(userId);
-            like.setVideoId(videoId);
-            likeMapper.insert(like);
-            video.setLikeCount((video.getLikeCount() != null ? video.getLikeCount() : 0) + 1);
-            updateById(video);
+        if (userId == null || videoId == null) return false;
+
+        // The relation unique key serializes competing toggles.  Do not use a
+        // read-then-insert sequence: two requests can otherwise both observe
+        // the relation as absent and increment the aggregate twice.
+        Video video = getById(videoId);
+        if (video == null) return false;
+
+        if (likeMapper.insertIgnore(userId, videoId) > 0) {
+            requireVideoCounterUpdate(baseMapper.incrementLike(videoId, 1), videoId, "like");
             updateAuthorFavorited(video.getAuthorUserId(), 1);
+            invalidateRecommendationPools(userId);
             return true;
-        } catch (Exception e) {
-            log.error("toggleLike: exception occurred", e);
+        }
+
+        // A duplicate insert means the relation existed at the insert
+        // statement's serialization point.  Only a successful delete is
+        // allowed to decrement the aggregate (a concurrent toggle may have
+        // removed it already).
+        if (likeMapper.deleteByUserAndVideo(userId, videoId) > 0) {
+            requireVideoCounterUpdate(baseMapper.incrementLike(videoId, -1), videoId, "like");
+            updateAuthorFavorited(video.getAuthorUserId(), -1);
+            invalidateRecommendationPools(userId);
             return false;
         }
+
+        // Another request completed the toggle between our two statements;
+        // report the currently visible relation without touching counters.
+        return hasLiked(userId, videoId);
     }
 
     private void updateAuthorFavorited(Long authorId, int delta) {
-        if (authorId == null) return;
+        if (authorId == null || authorId <= 0) return;
         try {
-            User author = userMapper.selectById(authorId);
-            if (author != null) {
-                author.setTotalFavorited(Math.max(0,
-                        (author.getTotalFavorited() != null ? author.getTotalFavorited() : 0) + delta));
-                userMapper.updateById(author);
-            }
+            // Keep the creator aggregate on the same transaction and use an
+            // SQL-side increment so concurrent likes cannot lose updates.
+            userMapper.incrementTotalFavorited(authorId, delta);
+        } catch (RuntimeException e) {
+            log.error("updateAuthorFavorited failed: authorId={}, delta={}", authorId, delta, e);
+            throw e;
         } catch (Exception e) {
             log.error("updateAuthorFavorited failed: authorId={}, delta={}", authorId, delta, e);
+            throw new IllegalStateException("Unable to update creator like counter", e);
+        }
+    }
+
+    private void requireVideoCounterUpdate(int rows, Long videoId, String counter) {
+        if (rows != 1) {
+            throw new IllegalStateException("Unable to update " + counter + " counter for video " + videoId);
         }
     }
 
@@ -460,35 +705,34 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
     @Override
     @Transactional
     public long recordShare(Long videoId) {
-        Video video = getById(videoId);
-        if (video == null) return 0;
-        video.setShareCount((video.getShareCount() != null ? video.getShareCount() : 0) + 1);
-        updateById(video);
-        return video.getShareCount();
+        if (videoId == null) return 0;
+        if (baseMapper.incrementShare(videoId, 1) != 1) return 0;
+        Long count = baseMapper.selectShareCount(videoId);
+        return count != null ? count : 0;
     }
 
     @Override
     @Transactional
     public boolean toggleCollect(Long userId, Long videoId) {
-        LambdaQueryWrapper<VideoCollect> wrapper = new LambdaQueryWrapper<VideoCollect>()
-                .eq(VideoCollect::getUserId, userId)
-                .eq(VideoCollect::getVideoId, videoId);
-        VideoCollect exist = collectMapper.selectOne(wrapper);
+        if (userId == null || videoId == null) return false;
         Video video = getById(videoId);
         if (video == null) return false;
-        if (exist != null) {
-            collectMapper.deleteById(exist.getId());
-            video.setCollectCount(Math.max(0, (video.getCollectCount() != null ? video.getCollectCount() : 0) - 1));
-            updateById(video);
+
+        if (collectMapper.insertIgnore(userId, videoId) > 0) {
+            requireVideoCounterUpdate(baseMapper.incrementCollect(videoId, 1), videoId, "collect");
+            invalidateRecommendationPools(userId);
+            return true;
+        }
+
+        if (collectMapper.deleteByUserAndVideo(userId, videoId) > 0) {
+            requireVideoCounterUpdate(baseMapper.incrementCollect(videoId, -1), videoId, "collect");
+            invalidateRecommendationPools(userId);
             return false;
         }
-        VideoCollect collect = new VideoCollect();
-        collect.setUserId(userId);
-        collect.setVideoId(videoId);
-        collectMapper.insert(collect);
-        video.setCollectCount((video.getCollectCount() != null ? video.getCollectCount() : 0) + 1);
-        updateById(video);
-        return true;
+
+        return collectMapper.selectCount(new LambdaQueryWrapper<VideoCollect>()
+                .eq(VideoCollect::getUserId, userId)
+                .eq(VideoCollect::getVideoId, videoId)) > 0;
     }
 
     @Override
@@ -533,36 +777,33 @@ public class VideoServiceImpl extends ServiceImpl<VideoMapper, Video> implements
                             String trafficSource, String sessionId, double swipeSeconds,
                             double lastPosition) {
         if (userId == null || videoId == null) return;
-        WatchHistory exist = watchHistoryMapper.selectOne(new LambdaQueryWrapper<WatchHistory>()
-                .eq(WatchHistory::getUserId, userId)
-                .eq(WatchHistory::getVideoId, videoId));
-        if (exist != null) {
-            if (watchDuration > (exist.getWatchDuration() != null ? exist.getWatchDuration() : 0)) {
-                exist.setWatchDuration(watchDuration);
-            }
-            exist.setVideoDuration(videoDuration);
-            if (finished) exist.setFinished(1);
-            exist.setRepeatCount((exist.getRepeatCount() != null ? exist.getRepeatCount() : 0) + 1);
-            if (trafficSource != null) exist.setTrafficSource(trafficSource);
-            if (sessionId != null) exist.setSessionId(sessionId);
-            if (swipeSeconds > 0) exist.setSwipeSeconds(swipeSeconds);
-            if (lastPosition > 0) exist.setLastPosition(lastPosition);
-            watchHistoryMapper.updateById(exist);
-        } else {
-            WatchHistory wh = new WatchHistory();
-            wh.setUserId(userId);
-            wh.setVideoId(videoId);
-            wh.setAuthorUserId(authorUserId);
-            wh.setWatchDuration(watchDuration);
-            wh.setVideoDuration(videoDuration);
-            wh.setFinished(finished ? 1 : 0);
-            wh.setRepeatCount(1);
-            wh.setTrafficSource(trafficSource);
-            wh.setSessionId(sessionId);
-            wh.setSwipeSeconds(swipeSeconds);
-            wh.setLastPosition(lastPosition);
-            watchHistoryMapper.insert(wh);
+        double safeWatchDuration = finiteNonNegative(watchDuration);
+        double safeVideoDuration = finiteNonNegative(videoDuration);
+        double safeSwipeSeconds = finiteNonNegative(swipeSeconds);
+        double safeLastPosition = finiteNonNegative(lastPosition);
+        watchHistoryMapper.upsertProgress(
+                userId,
+                videoId,
+                authorUserId != null ? authorUserId : 0L,
+                safeWatchDuration,
+                safeVideoDuration,
+                finished ? 1 : 0,
+                trafficSource,
+                sessionId,
+                safeSwipeSeconds,
+                safeLastPosition);
+    }
+
+    private static double finiteNonNegative(double value) {
+        return Double.isFinite(value) && value > 0 ? value : 0;
+    }
+
+    private void invalidateRecommendationPools(Long userId) {
+        synchronized (this) {
+            localRecommendationPools.keySet().removeIf(
+                    key -> key.startsWith(String.valueOf(userId) + ":"));
         }
+        if (redisCacheService != null) redisCacheService.invalidateRecommend(userId);
     }
 
     @Override

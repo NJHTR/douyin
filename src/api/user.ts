@@ -58,6 +58,23 @@ export function uploadVoice(file: Blob | File) {
   })
 }
 
+/** Direct object-storage upload contract. The API only signs and finalizes; bytes bypass Spring. */
+export function presignUpload(fileName: string, contentType: string, size: number) {
+  return request({
+    url: '/upload/presign',
+    method: 'post',
+    params: { fileName, contentType, size }
+  })
+}
+
+export function completeUpload(objectKey: string, fileName: string) {
+  return request({
+    url: '/upload/complete',
+    method: 'post',
+    params: { objectKey, fileName }
+  })
+}
+
 export function updateProfile(data: {
   nickname?: string
   signature?: string

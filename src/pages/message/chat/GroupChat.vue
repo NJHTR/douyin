@@ -167,6 +167,7 @@ import { connectSocket, onSocketMsg } from '@/utils/socket'
 import bus, { EVENT_KEY } from '@/utils/bus'
 import GroupAvatar from '@/components/GroupAvatar.vue'
 import defaultGroupPng from '@/assets/img/icon/people-gray.png'
+import { supportsMessageCapability } from '@/modules/message/messageCapabilities'
 
 defineOptions({ name: 'GroupChat' })
 
@@ -549,12 +550,19 @@ function startOptionGroupCall(isVideo: boolean) {
 }
 
 function pickImage() {
-  data.showOption = false(imageInput.value as HTMLInputElement | null)?.click()
+  data.showOption = false
+  const input = imageInput.value as HTMLInputElement | null
+  input?.click()
 }
 
 async function handleImagePicked(e: Event) {
   const file = (e.target as HTMLInputElement).files?.[0]
   if (!file) return
+  if (!supportsMessageCapability('GROUP', 'IMAGE')) {
+    _notice('群聊暂不支持图片消息')
+    return
+  }
+  if (data.sending) return
   try {
     data.sending = true
     const upRes = await uploadImage(file)
@@ -564,12 +572,14 @@ async function handleImagePicked(e: Event) {
         msg_type: 2,
         extra: upRes.data.url
       })
-      if (res.success && res.data) {
-        addLocalMessage(res.data)
-      }
+      if (!res.success || !res.data) throw new Error((res as any).msg || '图片消息发送失败')
+      addLocalMessage(res.data)
+    } else {
+      throw new Error((upRes as any).msg || '图片上传失败')
     }
-  } catch {
-    /* ignore */
+  } catch (error) {
+    _notice('图片发送失败，请重试')
+    console.error('[GroupChat] image message failed:', error)
   } finally {
     data.sending = false
     if (imageInput.value) (imageInput.value as HTMLInputElement).value = ''

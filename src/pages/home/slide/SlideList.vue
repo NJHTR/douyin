@@ -37,6 +37,13 @@ const props = defineProps({
     type: Function,
     default: void 0
   },
+  /** Stable feed mode parameters forwarded on every page request. */
+  requestParams: {
+    type: Object,
+    default() {
+      return {}
+    }
+  },
   index: {
     type: Number,
     default: 0
@@ -83,19 +90,23 @@ async function getData(refresh = false) {
   if (!refresh && state.totalSize === state.list.length) return
   if (baseStore.loading) return
   baseStore.loading = true
-  let res = await props.api({
-    start: refresh ? 0 : state.list.length,
-    pageSize: state.pageSize
-  })
-  // console.log('getSlide4Data-', refresh, res, state.totalSize, state.list.length)
-  baseStore.loading = false
-  if (res.success) {
-    state.totalSize = res.data.total || 0
-    if (refresh) {
-      state.list = []
+  try {
+    const res = await props.api({
+      ...props.requestParams,
+      start: refresh ? 0 : state.list.length,
+      pageSize: state.pageSize
+    })
+    if (res.success) {
+      const data = res.data || {}
+      state.totalSize = Number(data.total || 0)
+      if (refresh) state.list = []
+      const list = Array.isArray(data.list) ? data.list : []
+      state.list = state.list.concat(list)
     }
-    const list = res.data.list || []
-    state.list = state.list.concat(list)
+  } catch {
+    // A feed outage must not leave the shared loading flag permanently set.
+  } finally {
+    baseStore.loading = false
   }
 }
 

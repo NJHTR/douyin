@@ -20,6 +20,10 @@
         <!-- 活跃会话 Tab -->
         <template v-if="activeTab === 0">
           <Loading v-if="sessionsLoading" />
+          <div v-else-if="loadError" class="empty error-state">
+            <p>{{ loadError }}</p>
+            <button type="button" @click="loadSessions">重试</button>
+          </div>
           <template v-else>
             <div class="batch-action" v-if="sessions.length > 1">
               <div class="revoke-all-btn" @click="revokeAllOther">
@@ -107,12 +111,12 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { Icon } from '@iconify/vue'
 import Scroll from '@/components/Scroll.vue'
 import { getLoginHistory } from '@/api/user'
 import { getSessions, revokeSession, revokeAllOtherSessions } from '@/api/session'
-import { _showSimpleConfirmDialog } from '@/utils'
+import { _notice, _showSimpleConfirmDialog } from '@/utils'
 
 defineOptions({ name: 'LoginDevice' })
 
@@ -123,6 +127,7 @@ const sessions = ref<any[]>([])
 const currentSessionId = ref<number | null>(null)
 const historyList = ref<any[]>([])
 const revokingId = ref<number | null>(null)
+const loadError = ref('')
 
 onMounted(() => {
   loadSessions()
@@ -131,13 +136,16 @@ onMounted(() => {
 
 async function loadSessions() {
   sessionsLoading.value = true
+  loadError.value = ''
   try {
     const res = await getSessions()
-    if (res.success) {
-      sessions.value = res.data.sessions || []
-      currentSessionId.value = res.data.currentSessionId || null
-    }
-  } catch { sessions.value = [] }
+    if (!res.success) throw new Error(res.msg || res.message || '在线设备加载失败')
+    sessions.value = res.data.sessions || []
+    currentSessionId.value = res.data.currentSessionId || null
+  } catch (e: any) {
+    sessions.value = []
+    loadError.value = e?.message || '在线设备加载失败，请重试'
+  }
   sessionsLoading.value = false
 }
 
@@ -145,10 +153,12 @@ async function loadHistory() {
   historyLoading.value = true
   try {
     const res = await getLoginHistory({ pageNo: 1, pageSize: 50 })
-    if (res.success) {
-      historyList.value = res.data.list || []
-    }
-  } catch { historyList.value = [] }
+    if (!res.success) throw new Error(res.msg || res.message || '登录记录加载失败')
+    historyList.value = res.data.list || []
+  } catch (e: any) {
+    historyList.value = []
+    _notice(e?.message || '登录记录加载失败，请重试')
+  }
   historyLoading.value = false
 }
 
@@ -158,11 +168,13 @@ async function revokeOne(item: any) {
     async () => {
       revokingId.value = item.id
       try {
-        const res = await revokeSession(item.id)
-        if (res.success) {
-          sessions.value = sessions.value.filter(s => s.id !== item.id)
-        }
-      } catch {} finally {
+    const res = await revokeSession(item.id)
+        if (!res.success) throw new Error(res.msg || res.message || '退出设备失败')
+        sessions.value = sessions.value.filter(s => s.id !== item.id)
+        _notice('设备已退出')
+      } catch (e: any) {
+        _notice(e?.message || '退出设备失败，请重试')
+      } finally {
         revokingId.value = null
       }
     },
@@ -178,11 +190,12 @@ async function revokeAllOther() {
     async () => {
       try {
         const res = await revokeAllOtherSessions()
-        if (res.success) {
-          // 重新加载列表
-          await loadSessions()
-        }
-      } catch {}
+        if (!res.success) throw new Error(res.msg || res.message || '退出其他设备失败')
+        await loadSessions()
+        _notice('其他设备已退出')
+      } catch (e: any) {
+        _notice(e?.message || '退出其他设备失败，请重试')
+      }
     },
     null,
     '确定退出',
@@ -389,6 +402,19 @@ function formatTime(time: string): string {
       text-align: center;
       color: var(--second-text-color);
       padding-top: 100rem;
+    }
+  }
+
+  .error-state {
+    color: #777;
+    text-align: center;
+
+    button {
+      border: 0;
+      border-radius: 4rem;
+      padding: 6rem 16rem;
+      color: white;
+      background: #fe2c55;
     }
   }
 }

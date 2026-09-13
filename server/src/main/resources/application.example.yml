@@ -12,12 +12,16 @@
 server:
   port: 8080
 
+security:
+  trust-forwarded-headers: ${SECURITY_TRUST_FORWARDED_HEADERS:false}
+
 websocket:
   allowed-origins: ${WEBSOCKET_ALLOWED_ORIGINS:http://localhost:3000,http://127.0.0.1:3000}
   cluster:
     enabled: ${WEBSOCKET_CLUSTER_ENABLED:false}
     node-id: ${RTC_NODE_ID:local-api}
     channel: ${WEBSOCKET_CLUSTER_CHANNEL:douyin:websocket:fanout:v1}
+    live-channel: ${WEBSOCKET_LIVE_CLUSTER_CHANNEL:douyin:websocket:live-fanout:v1}
 
 douyin:
   kafka:
@@ -28,6 +32,10 @@ douyin:
       purge-interval-ms: ${KAFKA_RELIABILITY_PURGE_INTERVAL_MS:3600000}
 
 live:
+  control:
+    host-disconnect-grace-seconds: ${LIVE_HOST_DISCONNECT_GRACE_SECONDS:30}
+    host-lease-seconds: ${LIVE_HOST_LEASE_SECONDS:20}
+    host-lease-refresh-seconds: ${LIVE_HOST_LEASE_REFRESH_SECONDS:5}
   engine:
     enabled: ${LIVE_ENGINE_ENABLED:false}
   media:

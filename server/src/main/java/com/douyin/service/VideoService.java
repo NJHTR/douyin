@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.extension.service.IService;
 import com.douyin.entity.Video;
 import com.douyin.vo.VideoVO;
 import com.douyin.common.PageDTO;
+import com.douyin.common.CursorPageDTO;
 
 import java.util.List;
 
@@ -11,6 +12,21 @@ public interface VideoService extends IService<Video> {
 
     /** 推荐视频（可按类型过滤：长视频、普通推荐） */
     PageDTO<VideoVO> getRecommended(Long viewerUserId, int start, int pageSize, String type);
+
+    /**
+     * Channel-aware feed entry point.  The legacy overload remains the HOME
+     * channel so older clients do not need to change in lockstep.
+     */
+    default PageDTO<VideoVO> getRecommended(Long viewerUserId, int start, int pageSize,
+                                             String type, FeedChannel channel) {
+        return getRecommended(viewerUserId, start, pageSize, type);
+    }
+
+    /** Session-aware overload used to keep one browser feed on one candidate pool. */
+    default PageDTO<VideoVO> getRecommended(Long viewerUserId, int start, int pageSize,
+                                             String type, FeedChannel channel, String clientSessionId) {
+        return getRecommended(viewerUserId, start, pageSize, type, channel);
+    }
 
     PageDTO<VideoVO> getUserVideos(Long viewerUserId, Long userId, int pageNo, int pageSize);
 
@@ -22,8 +38,14 @@ public interface VideoService extends IService<Video> {
 
     PageDTO<VideoVO> getHistory(Long viewerUserId, int pageNo, int pageSize);
 
+    /** Keyset-paginated video watch history. */
+    CursorPageDTO<VideoVO> getHistoryCursor(Long viewerUserId, String cursor, int pageSize);
+
     /** 其他浏览历史(影视综等) */
     PageDTO<VideoVO> getHistoryOther(Long viewerUserId, int pageNo, int pageSize);
+
+    /** Database-filtered, keyset-paginated film/TV watch history. */
+    CursorPageDTO<VideoVO> getHistoryOtherCursor(Long viewerUserId, String cursor, int pageSize);
 
     /** 获取图文推荐 */
     PageDTO<VideoVO> getRecommendedPosts(Long viewerUserId, int pageNo, int pageSize);

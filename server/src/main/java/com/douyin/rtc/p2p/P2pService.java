@@ -2,6 +2,8 @@ package com.douyin.rtc.p2p;
 
 import com.douyin.rtc.domain.CallDomainException;
 import com.douyin.rtc.domain.CallErrorCode;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
 
 import java.time.Clock;
 import java.util.ArrayList;
@@ -15,6 +17,7 @@ import java.util.UUID;
  * 只做状态/consent/generation/审计编排;不下发 STUN/TURN 决策外的任何媒体动作,
  * 不持久化 SDP/ICE 原文。真实双浏览器/NAT 验收前功能开关必须保持关闭(fail-closed)。
  */
+@Service
 public class P2pService {
 
     public static final long SYSTEM_ACTOR = -1L;
@@ -28,6 +31,7 @@ public class P2pService {
     private final String effectiveSecret;
     private final List<P2pAuditEntry> auditTrail = new ArrayList<>();
 
+    @Autowired
     public P2pService(P2pStateStore store, P2pProperties properties, P2pMetrics metrics) {
         this(store, properties, metrics, Clock.systemUTC());
     }

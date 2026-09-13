@@ -2,6 +2,7 @@ package com.douyin.mapper;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import com.douyin.entity.Like;
+import org.apache.ibatis.annotations.Insert;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 
@@ -10,6 +11,15 @@ import java.util.Map;
 
 public interface LikeMapper extends BaseMapper<Like> {
 
+    /**
+     * Insert a like exactly once.  The uk_user_video unique key is the
+     * concurrency boundary; a duplicate request returns 0 instead of
+     * throwing and never creates a second relation row.
+     */
+    @Insert("INSERT IGNORE INTO t_like (user_id, video_id, create_time) " +
+            "VALUES (#{userId}, #{videoId}, CURRENT_TIMESTAMP)")
+    int insertIgnore(@Param("userId") Long userId, @Param("videoId") Long videoId);
+
     /** 协同过滤: 找到与用户已赞视频共同被赞的视频 */
     @Select("<script>SELECT l2.video_id, COUNT(*) as co_count FROM t_like l1 " +
             "JOIN t_like l2 ON l1.user_id = l2.user_id AND l1.video_id != l2.video_id " +
@@ -17,14 +27,18 @@ public interface LikeMapper extends BaseMapper<Like> {
             "<if test='excludeIds != null and excludeIds.size() > 0'>" +
             "AND l2.video_id NOT IN <foreach collection='excludeIds' item='eid' open='(' separator=',' close=')'>#{eid}</foreach> " +
             "</if>" +
-            "GROUP BY l2.video_id ORDER BY co_count DESC LIMIT #{limit}</script>")
+            "GROUP BY l2.video_id ORDER BY co_count DESC, l2.video_id DESC LIMIT #{limit}</script>")
     List<Map<String, Object>> findCoLikedVideoIds(@Param("videoIds") List<Long> videoIds,
                                                    @Param("excludeIds") List<Long> excludeIds,
                                                    @Param("limit") int limit);
 
     /** 获取用户最近点赞的视频ID列表 */
-    @Select("SELECT video_id FROM t_like WHERE user_id = #{userId} ORDER BY create_time DESC LIMIT #{limit}")
+    @Select("SELECT video_id FROM t_like WHERE user_id = #{userId} ORDER BY create_time DESC, id DESC LIMIT #{limit}")
     List<Long> findRecentLikedVideoIds(@Param("userId") Long userId, @Param("limit") int limit);
+
+    @Select("SELECT video_id, create_time FROM t_like WHERE user_id = #{userId} " +
+            "ORDER BY create_time DESC, id DESC LIMIT #{limit}")
+    List<Like> findRecentLikes(@Param("userId") Long userId, @Param("limit") int limit);
 
     /** 批量统计候选视频的近期点赞数 */
     @Select("<script>SELECT video_id, COUNT(*) as cnt FROM t_like " +

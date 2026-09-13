@@ -1,20 +1,23 @@
 <template>
   <UserPanel
-    v-if="!data.loading"
+    v-if="!data.loading && !data.error"
     ref="userPanelRef"
     v-model:currentItem="data.currentItem"
     :active="!data.loading"
+    :show-overflow-menu="false"
     @back="$router.back()"
-    @showFollowSetting="_no"
     @showFollowSetting2="handleCancelFollow"
   />
-  <Loading v-else :is-full-screen="false" />
+  <Loading v-else-if="data.loading" :is-full-screen="false" />
+  <div v-if="!data.loading && data.error" class="load-error">
+    <span>{{ data.error }}</span>
+    <button type="button" @click="loadUser(String(route.params.uid || ''))">重试</button>
+  </div>
 </template>
 <script setup lang="ts">
 import { onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { panel, recordVisit } from '@/api/user'
-import { _no } from '@/utils'
 import UserPanel from '@/components/UserPanel.vue'
 import Loading from '@/components/Loading.vue'
 
@@ -24,10 +27,11 @@ const route = useRoute()
 const userPanelRef = ref<InstanceType<typeof UserPanel>>()
 const data = reactive({
   loading: true,
+  error: '',
   currentItem: {
     author: { uid: null },
     aweme_list: []
-  }
+  } as any
 })
 
 function handleCancelFollow() {
@@ -37,11 +41,11 @@ function handleCancelFollow() {
 async function loadUser(uid: string) {
   if (!uid) return
   data.loading = true
-  const infoRes = await panel({ uid })
-  console.log('UserHome panel response:', infoRes)
-  if (infoRes.success) {
+  data.error = ''
+  try {
+    const infoRes = await panel({ uid })
+    if (!infoRes.success) throw new Error(infoRes.msg || infoRes.message || '用户资料加载失败')
     const u = infoRes.data
-    console.log('UserHome panel data:', { follower_count: u.follower_count, following_count: u.following_count, uid: u.uid })
     const uidVal = u.uid != null ? u.uid : uid
     data.currentItem = {
       author: {
@@ -67,10 +71,13 @@ async function loadUser(uid: string) {
       },
       aweme_list: []
     }
+  } catch (e: any) {
+    data.error = e?.message || '用户资料加载失败，请重试'
+  } finally {
+    data.loading = false
   }
-  data.loading = false
   // 记录访客
-  try { recordVisit(Number(uid)) } catch { /* ignore */ }
+  void recordVisit(Number(uid)).catch(() => {})
 }
 
 onMounted(() => {
@@ -84,3 +91,23 @@ watch(
   }
 )
 </script>
+
+<style scoped>
+.load-error {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: #999;
+}
+
+.load-error button {
+  border: 0;
+  border-radius: 4px;
+  padding: 7px 18px;
+  color: white;
+  background: #fe2c55;
+}
+</style>

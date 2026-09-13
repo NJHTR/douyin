@@ -33,8 +33,8 @@ export function hasPassword() {
   return request({ url: '/user/has-password', method: 'get' })
 }
 
-export function sendEmailCode(email: string) {
-  return request({ url: '/email/send-code', method: 'post', data: { email } })
+export function sendEmailCode(email: string, idempotencyKey?: string) {
+  return request({ url: '/email/send-code', method: 'post', data: { email, idempotency_key: idempotencyKey } })
 }
 
 export function loginByEmail(email: string, code: string) {

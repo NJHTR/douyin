@@ -2,6 +2,9 @@ package com.douyin.controller;
 
 import com.douyin.common.Result;
 import com.douyin.config.MinioConfig;
+import com.douyin.service.RedisCacheService;
+import com.douyin.service.UploadPolicy;
+import com.douyin.utils.JwtUtil;
 import io.minio.*;
 import io.minio.errors.MinioException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -12,6 +15,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.*;
 import java.security.GeneralSecurityException;
+import java.time.Duration;
 import java.util.*;
 
 @Slf4j
@@ -22,10 +26,15 @@ public class ChunkUploadController {
 
     private final MinioClient minioClient;
     private final MinioConfig minioConfig;
+    private final JwtUtil jwtUtil;
+    private final RedisCacheService redisCacheService;
 
-    public ChunkUploadController(MinioClient minioClient, MinioConfig minioConfig) {
+    public ChunkUploadController(MinioClient minioClient, MinioConfig minioConfig, JwtUtil jwtUtil,
+                                 RedisCacheService redisCacheService) {
         this.minioClient = minioClient;
         this.minioConfig = minioConfig;
+        this.jwtUtil = jwtUtil;
+        this.redisCacheService = redisCacheService;
     }
 
     /**
@@ -40,17 +49,21 @@ public class ChunkUploadController {
             @RequestParam("uploadId") String uploadId,
             @RequestParam("chunkIndex") int chunkIndex,
             @RequestParam("totalChunks") int totalChunks,
-            @RequestParam("fileName") String fileName) {
+            @RequestParam("fileName") String fileName,
+            HttpServletRequest request) {
 
+        Long userId = getLoginUserId(request);
+        if (userId == null) return Result.fail("请先登录");
         if (uploadId == null || uploadId.length() < 8 || uploadId.length() > 128) {
             return Result.fail("无效的 uploadId");
         }
-        if (chunkIndex < 0 || chunkIndex >= totalChunks) {
-            return Result.fail("chunkIndex 越界");
-        }
+        if (!redisCacheService.rateLimit("upload:chunk", userId + ":" + uploadId,
+                600, Duration.ofMinutes(1))) return rateLimited();
+        try { UploadPolicy.validateChunk(file, chunkIndex, totalChunks, fileName); }
+        catch (IllegalArgumentException e) { return Result.fail(e.getMessage()); }
 
         String bucket = minioConfig.getBucketVideo();
-        String chunkKey = String.format("chunks/%s/%05d", uploadId, chunkIndex);
+        String chunkKey = String.format("chunks/%d/%s/%05d", userId, uploadId, chunkIndex);
 
         try {
             ensureBucket(bucket);
@@ -106,15 +119,21 @@ public class ChunkUploadController {
 
         String uploadId = (String) body.get("uploadId");
         String fileName = (String) body.get("fileName");
+        Long userId = getLoginUserId(request);
+        if (userId == null) return Result.fail("请先登录");
         Integer totalChunks = body.get("totalChunks") instanceof Integer
                 ? (Integer) body.get("totalChunks") : null;
 
-        if (uploadId == null || uploadId.length() < 8) {
+        if (uploadId == null || uploadId.length() < 8 || uploadId.length() > 128) {
             return Result.fail("无效的 uploadId");
         }
-        if (totalChunks == null || totalChunks <= 0 || totalChunks > 2000) {
+        if (!redisCacheService.rateLimit("upload:merge", String.valueOf(userId),
+                30, Duration.ofMinutes(1))) return rateLimited();
+        if (totalChunks == null || totalChunks <= 0 || totalChunks > UploadPolicy.MAX_CHUNKS) {
             return Result.fail("totalChunks 超出范围");
         }
+        try { UploadPolicy.validateName(fileName, UploadPolicy.Kind.VIDEO); }
+        catch (IllegalArgumentException e) { return Result.fail(e.getMessage()); }
 
         String bucket = minioConfig.getBucketVideo();
         String ext = extractExt(fileName);
@@ -124,10 +143,14 @@ public class ChunkUploadController {
         try {
             // 验证所有分片存在
             int found = 0;
+            long totalBytes = 0;
             for (int i = 0; i < totalChunks; i++) {
-                String chunkKey = String.format("chunks/%s/%05d", uploadId, i);
+                String chunkKey = String.format("chunks/%d/%s/%05d", userId, uploadId, i);
                 try {
-                    minioClient.statObject(StatObjectArgs.builder().bucket(bucket).object(chunkKey).build());
+                    StatObjectResponse stat = minioClient.statObject(
+                            StatObjectArgs.builder().bucket(bucket).object(chunkKey).build());
+                    totalBytes = Math.addExact(totalBytes, stat.size());
+                    if (totalBytes > UploadPolicy.MAX_VIDEO_BYTES) return Result.fail("文件超过大小限制");
                     found++;
                 } catch (Exception e) {
                     log.error("分片缺失: {}", chunkKey);
@@ -142,7 +165,7 @@ public class ChunkUploadController {
             // MinIO 没有 append API, 用 compose 合并 (最多合并 1000 个源对象)
             List<ComposeSource> sources = new ArrayList<>();
             for (int i = 0; i < totalChunks; i++) {
-                String chunkKey = String.format("chunks/%s/%05d", uploadId, i);
+                String chunkKey = String.format("chunks/%d/%s/%05d", userId, uploadId, i);
                 sources.add(ComposeSource.builder()
                         .bucket(bucket)
                         .object(chunkKey)
@@ -165,7 +188,7 @@ public class ChunkUploadController {
 
             // 清理分片
             for (int i = 0; i < totalChunks; i++) {
-                String chunkKey = String.format("chunks/%s/%05d", uploadId, i);
+                String chunkKey = String.format("chunks/%d/%s/%05d", userId, uploadId, i);
                 try {
                     minioClient.removeObject(
                             RemoveObjectArgs.builder().bucket(bucket).object(chunkKey).build()
@@ -201,7 +224,19 @@ public class ChunkUploadController {
 
     private String extractExt(String fileName) {
         if (fileName == null) return "";
-        int dot = fileName.lastIndexOf('.');
-        return dot >= 0 ? fileName.substring(dot).toLowerCase() : "";
+        String ext = UploadPolicy.extension(fileName);
+        return ext.isEmpty() ? "" : "." + ext;
+    }
+
+    private Long getLoginUserId(HttpServletRequest request) {
+        String auth = request.getHeader("Authorization");
+        if (auth != null && auth.startsWith("Bearer ")) {
+            try { return jwtUtil.getUserIdFromToken(auth.substring(7)); } catch (Exception ignored) {}
+        }
+        return null;
+    }
+
+    private <T> Result<T> rateLimited() {
+        return Result.fail(429, "上传请求过于频繁，请稍后再试");
     }
 }

@@ -198,4 +198,47 @@ git diff <parent>..<commit>
 
 最终回复必须包含：完成内容、使用的智能体、合并提交、测试命令和结果、剩余风险、下一任务。
 
+## 8. 全项目交互一致性专项（INTERACTION CONSISTENCY AUDIT）
+
+P0/P1 架构、安全、并发、一致性和推荐修复稳定后，必须执行独立的
+`INTERACTION CONSISTENCY AUDIT`。验收对象不只是接口和页面可打开，而是完整的：
+
+`用户 → 入口 → Route → Page → Component → API → Domain → Persistence → Response → State → UI`。
+
+### 8.1 必须产出
+
+- `docs/audit/UX_ISSUE_REGISTER.md`
+- `docs/audit/FEATURE_PARITY_MATRIX.md`
+- `docs/audit/PAGE_INTERACTION_MATRIX.md`
+- `docs/audit/USER_JOURNEY_TEST_REPORT.md`
+- `docs/audit/INTERACTION_CONSISTENCY_REPORT.md`
+
+并更新 `ROADMAP.md`、`NEXT_TASK.md`、`CHANGELOG.md`、
+`docs/audit/IMPLEMENTATION_PROGRESS.md`。
+
+### 8.2 审计范围
+
+扫描首页、Feed、搜索、消息、私聊、群聊、联系人、好友、关注、个人主页、视频详情、评论、收藏、历史、通知、直播、商城、用户中心和设置的所有 Router、Navigation、Deep Link、Button、Link、Tab、Card、Banner、Menu 和 Action Sheet，建立 Feature/入口/页面/组件/API/权限/状态/实现/一致性矩阵。
+
+重点核对：
+
+1. 同一业务的所有入口是否复用同一个 canonical Route、Feature Module、Domain Operation 和数据源。
+2. 同一能力在私聊/群聊等上下文是否有明确 `MessageCapability`（TEXT、IMAGE、VIDEO、FILE、AUDIO、REPLY、FORWARD 等）；不支持时必须隐藏、禁用或标明 Coming Soon，禁止点击后才返回 500。
+3. 首页搜索、消息搜索、添加好友搜索、联系人搜索和群成员搜索是否遵守明确的 `Search Scope` 和统一 `User Search Contract`；语义不同必须在 UI 中说明。
+4. Follow、Like、Favorite、Friend、Message、Report 等操作是否通过 Feature Hook/Application Service 调用 canonical API，避免页面自有业务逻辑。
+5. 操作后的状态是否通过 optimistic update + rollback、事件传播、缓存失效或约定的 eventual consistency 在 Feed、Profile、Search、Message、Contacts 等页面保持一致。
+6. 所有异步流程都必须具备统一的 Initial、Loading、Ready、Empty、Error、Retry、Refreshing、LoadingMore、Submitting、Success、Disabled、Offline、Reconnect 状态；错误按 400/401/403/404/409/429/500/超时/网络/上传/WebSocket 分类处理。
+7. 检查重复点击、幂等、debounce/disable while submitting、网络断开、返回、刷新、Deep Link、滚动位置、查询条件和状态恢复。
+8. 检查头像、昵称、关注/好友/已读/未读/点赞/收藏等 canonical source、DTO、缓存和失效策略，避免同一用户或同一事实在不同页面不一致。
+
+### 8.3 用户旅程和交叉入口验收
+
+至少验证以下真实路径：新用户搜索用户并关注后进入消息；首页搜索后添加好友并发送私信/图片；消息设置添加好友；群聊文本/图片/文件；视频评论/点赞/收藏/关注作者；首页商城入口和底部商城入口；直接 Deep Link 与正常导航进入同一资源。核心功能至少从 2～3 个入口执行，并覆盖成功、失败、空、加载、重试、返回、刷新、重复点击和网络失败。
+
+若入口 A 可用而入口 B 不可用、同一搜索结果不同、同一状态显示不同、同一操作错误处理不同、入口指向 TODO/404/空白页，按 P1/UX Integrity Issue 登记并继续修复。不要为了视觉统一破坏 HOME/FOLLOWING、私聊/群聊等本来有业务语义差异的能力；一致性要求是契约、权限、状态和用户预期一致，而不是所有页面完全相同。
+
+### 8.4 完成门槛
+
+每个修复必须增加 E2E、集成或组件回归测试，并在 `UX_ISSUE_REGISTER.md` 记录 owner、根因、入口链路、API、权限、状态、变更文件、回滚方案和验证证据。随机抽取至少 20 个核心功能，每项从 2～3 个入口复测；仍出现“这里可以、那里不行”、点击后才发现不支持、刷新/返回状态回滚或网络失败永久 Loading 时，不得宣称交互专项完成。
+
 ---

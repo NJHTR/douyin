@@ -284,6 +284,7 @@ import { useNav } from '@/utils/hooks/useNav'
 import bus, { EVENT_KEY } from '@/utils/bus'
 import { getChatHistory, markRead, sendMessage } from '@/api/message'
 import { connectSocket, disconnectSocket, onSocketMsg } from '@/utils/socket'
+import { supportsMessageCapability } from '@/modules/message/messageCapabilities'
 
 let CALL_STATE = {
   REJECT: 0,
@@ -457,6 +458,10 @@ function startOptionCall(isVideo: boolean) {
 async function handleImagePicked(e: Event) {
   const file = (e.target as HTMLInputElement).files?.[0]
   if (!file) return
+  if (!supportsMessageCapability('PRIVATE', 'IMAGE')) {
+    _notice('私聊暂不支持图片消息')
+    return
+  }
   try {
     data.loading = true
     const formData = new FormData()

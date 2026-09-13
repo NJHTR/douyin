@@ -9,11 +9,13 @@ import com.douyin.mapper.UserMapper;
 import com.douyin.mapper.VideoMapper;
 import com.douyin.mapper.VisitorMapper;
 import com.douyin.service.UserService;
+import com.douyin.service.RedisCacheService;
 import com.douyin.utils.JwtUtil;
 import com.douyin.vo.UserVO;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.util.HashSet;
 import java.util.List;
@@ -29,14 +31,22 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
     private final FollowMapper followMapper;
     private final VideoMapper videoMapper;
     private final VisitorMapper visitorMapper;
+    private final RedisCacheService redisCacheService;
     private final BCryptPasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     public UserServiceImpl(JwtUtil jwtUtil, FollowMapper followMapper, VideoMapper videoMapper,
                            VisitorMapper visitorMapper) {
+        this(jwtUtil, followMapper, videoMapper, visitorMapper, null);
+    }
+
+    @Autowired
+    public UserServiceImpl(JwtUtil jwtUtil, FollowMapper followMapper, VideoMapper videoMapper,
+                           VisitorMapper visitorMapper, RedisCacheService redisCacheService) {
         this.jwtUtil = jwtUtil;
         this.followMapper = followMapper;
         this.videoMapper = videoMapper;
         this.visitorMapper = visitorMapper;
+        this.redisCacheService = redisCacheService;
     }
 
     private static final String DEFAULT_AVATAR = "/images/default-avatar.svg";
@@ -173,6 +183,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
             followMapper.deleteById(exist.getId());
             updateCount(userId, true, -1);       // 自己的关注数-1
             updateCount(targetUserId, false, -1); // 对方的粉丝数-1
+            invalidateRecommendationPools(userId);
             return false;
         }
         Follow f = new Follow();
@@ -181,7 +192,12 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         followMapper.insert(f);
         updateCount(userId, true, 1);       // 自己的关注数+1
         updateCount(targetUserId, false, 1); // 对方的粉丝数+1
+        invalidateRecommendationPools(userId);
         return true;
+    }
+
+    private void invalidateRecommendationPools(Long userId) {
+        if (redisCacheService != null) redisCacheService.invalidateRecommend(userId);
     }
 
     @Override

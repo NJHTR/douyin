@@ -1,12 +1,19 @@
 package com.douyin.service;
 
 import lombok.extern.slf4j.Slf4j;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
@@ -20,10 +27,13 @@ import java.util.concurrent.TimeUnit;
 public class RedisCacheService {
 
     private final RedisTemplate<String, Object> redis;
+    private final StringRedisTemplate recommendRedis;
+    private final ObjectMapper recommendObjectMapper;
 
     private static final String PREFIX_VIDEO = "douyin:video:meta:";
     private static final String PREFIX_USER = "douyin:user:profile:";
     private static final String PREFIX_RECOMMEND = "douyin:recommend:feed:";
+    private static final String PREFIX_RECOMMEND_POOL = "douyin:recommend:pool:";
     private static final String PREFIX_HOTWORDS = "douyin:search:hotwords";
     private static final String PREFIX_RATE_LIMIT = "douyin:ratelimit:";
     private static final String PREFIX_IDEMPOTENT = "douyin:idempotent:";
@@ -34,8 +44,17 @@ public class RedisCacheService {
     private static final Duration TTL_RECOMMEND = Duration.ofMinutes(5);
     private static final Duration TTL_IDEMPOTENT = Duration.ofMinutes(30);
 
+    /** Compatibility constructor for focused unit tests and non-Spring uses. */
     public RedisCacheService(RedisTemplate<String, Object> redis) {
+        this(redis, null);
+    }
+
+    @Autowired
+    public RedisCacheService(RedisTemplate<String, Object> redis,
+                             StringRedisTemplate recommendRedis) {
         this.redis = redis;
+        this.recommendRedis = recommendRedis;
+        this.recommendObjectMapper = new ObjectMapper();
     }
 
     // ==================== 通用缓存 ====================
@@ -128,9 +147,119 @@ public class RedisCacheService {
         put(PREFIX_RECOMMEND + userId + ":" + pageNum, (Object) videoIds, TTL_RECOMMEND);
     }
 
+    /**
+     * Read a bounded candidate pool for one viewer/channel/browser session.
+     * The session dimension prevents a feed generated for one tab from being
+     * reused by another tab while the viewer and channel stay the same.
+     */
+    public Optional<List<Long>> getRecommendPool(Long userId, FeedChannel channel, String sessionId) {
+        if (userId == null || channel == null) return Optional.empty();
+        String key = recommendPoolKey(userId, channel, sessionId);
+        if (recommendRedis != null) {
+            try {
+                String raw = recommendRedis.opsForValue().get(key);
+                if (raw == null) return Optional.empty();
+                return Optional.of(parseRecommendPool(raw));
+            } catch (Exception e) {
+                log.warn("Redis recommendation pool GET failed key={}: {}", key, e.getMessage());
+                return Optional.empty();
+            }
+        }
+
+        // Compatibility path for callers that construct this service without
+        // the dedicated string template (primarily older tests).
+        Optional<Object> value = get(key);
+        if (value.isEmpty()) return Optional.empty();
+        Object raw = value.get();
+        if (!(raw instanceof Collection<?> collection)) return Optional.of(List.of());
+        return Optional.of(normalizePool(collection));
+    }
+
+    /** Store at most one recommendation pool per user/channel/session. */
+    public void putRecommendPool(Long userId, FeedChannel channel, String sessionId, List<Long> videoIds) {
+        if (userId == null || channel == null || videoIds == null) return;
+        List<Long> bounded = videoIds.stream()
+                .filter(Objects::nonNull)
+                .distinct()
+                .limit(RecommendationConfig.CANDIDATE_POOL_SIZE)
+                .toList();
+        String key = recommendPoolKey(userId, channel, sessionId);
+        if (recommendRedis != null) {
+            try {
+                recommendRedis.opsForValue().set(key,
+                        recommendObjectMapper.writeValueAsString(bounded), TTL_RECOMMEND);
+            } catch (Exception e) {
+                log.warn("Redis recommendation pool PUT failed key={}: {}", key, e.getMessage());
+            }
+            return;
+        }
+        put(key, bounded, TTL_RECOMMEND);
+    }
+
+    private List<Long> parseRecommendPool(String raw) throws Exception {
+        JsonNode node = recommendObjectMapper.readTree(raw);
+        // Older GenericJackson2JsonRedisSerializer versions used a wrapper
+        // array such as ["java.util.ArrayList", [1, 2]].
+        if (node != null && node.isArray() && node.size() == 2
+                && node.get(0).isTextual() && node.get(1).isArray()) {
+            node = node.get(1);
+        }
+        // A string value can appear when a legacy serializer encoded JSON as
+        // a JSON string. Decode it once more before normalizing the IDs.
+        if (node != null && node.isTextual()) {
+            node = recommendObjectMapper.readTree(node.textValue());
+        }
+        if (node == null || !node.isArray()) return List.of();
+        List<Long> ids = new ArrayList<>();
+        node.forEach(value -> {
+            Long id = value.isNumber() ? value.longValue() : toLong(value.asText(null));
+            if (id != null && !ids.contains(id)) ids.add(id);
+        });
+        return ids.stream().limit(RecommendationConfig.CANDIDATE_POOL_SIZE).toList();
+    }
+
+    private List<Long> normalizePool(Collection<?> collection) {
+        return collection.stream()
+                .map(RedisCacheService::toLong)
+                .filter(Objects::nonNull)
+                .distinct()
+                .limit(RecommendationConfig.CANDIDATE_POOL_SIZE)
+                .toList();
+    }
+
+    private String recommendPoolKey(Long userId, FeedChannel channel, String sessionId) {
+        return PREFIX_RECOMMEND_POOL + userId + ":" + channel.name() + ":" + digestDimension(sessionId);
+    }
+
+    private static String digestDimension(String value) {
+        String input = value == null || value.isBlank() ? "legacy" : value.trim();
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder out = new StringBuilder(16);
+            for (int i = 0; i < 8 && i < digest.length; i++) {
+                out.append(String.format("%02x", digest[i]));
+            }
+            return out.toString();
+        } catch (NoSuchAlgorithmException impossible) {
+            return Integer.toHexString(input.hashCode());
+        }
+    }
+
+    private static Long toLong(Object value) {
+        if (value instanceof Number number) return number.longValue();
+        if (value == null) return null;
+        try {
+            return Long.valueOf(value.toString());
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
     /** 用户有新行为(点赞/收藏/关注)时失效其推荐缓存 */
     public void invalidateRecommend(Long userId) {
         deleteByPattern(PREFIX_RECOMMEND + userId + ":*");
+        deleteByPattern(PREFIX_RECOMMEND_POOL + userId + ":*");
     }
 
     // ==================== 搜索热词 (ZSet) ====================
@@ -175,7 +304,10 @@ public class RedisCacheService {
             local limit = tonumber(ARGV[1])
             local window = tonumber(ARGV[2])
             local current = redis.call('INCR', key)
-            if current == 1 then
+            -- Repair legacy keys that were created without an expiry. Without
+            -- this guard one bad key can permanently block an identifier.
+            local ttl = redis.call('TTL', key)
+            if ttl < 0 then
                 redis.call('EXPIRE', key, window)
             end
             if current > limit then
@@ -197,7 +329,7 @@ public class RedisCacheService {
             return result != null && result == 1;
         } catch (Exception e) {
             log.warn("Rate limit check failed: action={} id={}", action, identifier, e);
-            return true; // Redis 不可用时放行
+            return false; // Redis 不可用时拒绝，避免无限制放行
         }
     }
 
@@ -214,7 +346,7 @@ public class RedisCacheService {
             return Boolean.TRUE.equals(ok);
         } catch (Exception e) {
             log.warn("Idempotent lock failed key={}: {}", idempotencyKey, e.getMessage());
-            return true; // Redis 不可用时放行，避免阻塞正常业务
+            throw new RedisCoordinationUnavailableException("idempotency", e);
         }
     }
 
@@ -232,7 +364,7 @@ public class RedisCacheService {
             return Boolean.TRUE.equals(ok) ? token : null;
         } catch (Exception e) {
             log.warn("Distributed lock failed resource={}: {}", resource, e.getMessage());
-            return UUID.randomUUID().toString(); // Redis 不可用时返回假 token，不阻塞
+            throw new RedisCoordinationUnavailableException("lock", e);
         }
     }
 

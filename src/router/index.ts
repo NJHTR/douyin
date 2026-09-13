@@ -15,9 +15,20 @@ const router = createRouter({
     }
   }
 })
+
+// Route-array order is an implementation detail, not navigation hierarchy.
+// Keep a deterministic fallback for transition direction when a route is
+// reached through an alias or a dynamically generated URL.
+function navigationDepth(path: string): number {
+  const normalized = path.split('?')[0].replace(/^\/+|\/+$/g, '')
+  if (!normalized) return 0
+  return normalized.split('/').length
+}
+
 router.beforeEach((to, from) => {
-  // 清除滑动标记，防止全局点击代理吞掉所有 click 事件导致页面卡死
+  // 清除滑动后的合成点击抑制标记，避免跨路由残留手势状态
   ;(window as any).isMoved = false
+  ;(window as any).isMovedEl = null
   // Admin route guard
   if (to.path.startsWith('/admin')) {
     const baseStore = useBaseStore()
@@ -43,8 +54,8 @@ router.beforeEach((to, from) => {
     return true
   }
 
-  const toDepth = routes.findIndex((v) => v.path === to.path)
-  const fromDepth = routes.findIndex((v) => v.path === from.path)
+  const toDepth = navigationDepth(to.path)
+  const fromDepth = navigationDepth(from.path)
   // const fromDepth = routeDeep.indexOf(from.path)
 
   if (toDepth > fromDepth) {

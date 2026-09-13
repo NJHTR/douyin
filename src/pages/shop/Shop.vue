@@ -90,7 +90,7 @@
                   <Icon icon="material-symbols-light:charging-station-outline" />
                   <div>手机充值</div>
                 </div>
-                <div class="option" @click="nav('/message')">
+                <div class="option" @click="nav('/message/shop-messages')">
                   <Icon icon="system-uicons:message" />
                   <div>购物消息</div>
                 </div>

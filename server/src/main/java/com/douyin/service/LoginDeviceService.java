@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.net.URI;
@@ -24,6 +25,10 @@ import java.util.List;
 @Slf4j
 @Service
 public class LoginDeviceService {
+
+    /** Forwarded headers are attacker-controlled unless a trusted proxy is configured. */
+    @Value("${security.trust-forwarded-headers:false}")
+    private boolean trustForwardedHeaders;
 
     private final LoginHistoryMapper loginHistoryMapper;
     private final SystemNoticeService systemNoticeService;
@@ -359,6 +364,9 @@ public class LoginDeviceService {
     }
 
     private String getClientIp(HttpServletRequest req) {
+        // In a direct deployment, always use the socket peer address. Accepting
+        // X-Forwarded-For by default lets clients bypass IP rate limits by spoofing it.
+        if (!trustForwardedHeaders) return req.getRemoteAddr();
         String ip = req.getHeader("X-Forwarded-For");
         if (ip != null && !ip.isEmpty() && !"unknown".equalsIgnoreCase(ip)) {
             int idx = ip.indexOf(',');

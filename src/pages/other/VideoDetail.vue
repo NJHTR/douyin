@@ -119,13 +119,15 @@ import { DefaultUser } from '@/utils/const_var'
 import { _checkImgUrl, slideItemRender } from '@/utils'
 import { useBaseStore } from '@/store/pinia'
 import SlideVerticalInfinite from '@/components/slide/SlideVerticalInfinite.vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
+import { recommendedVideo } from '@/api/videos'
 
 defineOptions({
   name: 'VideoDetail'
 })
 const nav = useNav()
 const router = useRouter()
+const route = useRoute()
 
 const baseStore = useBaseStore()
 
@@ -165,11 +167,19 @@ const state = reactive({
 
 const render = slideItemRender()
 
-onMounted(() => {
-  // console.log('s', store.routeData)
-  state.index = baseStore.routeData.index
-  state.list = baseStore.routeData.list
-  // console.log('sss', state.list[state.index])
+onMounted(async () => {
+  if (baseStore.routeData?.list?.length) {
+    state.index = baseStore.routeData.index || 0
+    state.list = baseStore.routeData.list
+    return
+  }
+  const res = await recommendedVideo({ start: 0, pageSize: 12 })
+  if (!res.success) return
+  const list = Array.isArray(res.data) ? res.data : res.data?.list || []
+  const requested = String(route.query.id || '')
+  const index = Math.max(0, list.findIndex((item) => String(item.aweme_id ?? item.id) === requested))
+  state.index = index
+  state.list = list
 })
 
 function delayShowDialog(cb) {

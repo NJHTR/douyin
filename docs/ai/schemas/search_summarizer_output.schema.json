@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nivo://ai/schemas/search-summarizer-output/v1",
+  "title": "NIVO Search Summarizer output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "evidence_result_ids"],
+  "properties": {
+    "summary": {"type": "string", "minLength": 1, "maxLength": 160},
+    "evidence_result_ids": {"type": "array", "maxItems": 10, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}}
+  }
+}

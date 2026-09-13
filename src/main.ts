@@ -12,30 +12,23 @@ window.isMoved = false
 ;(window as any).isMovedEl = null
 window.isMuted = true
 window.showMutedNotice = true
-HTMLElement.prototype.addEventListener = new Proxy(HTMLElement.prototype.addEventListener, {
-  apply(target, ctx, args) {
-    const eventName = args[0]
-    const listener = args[1]
-    if (listener instanceof Function && eventName === 'click') {
-      args[1] = new Proxy(listener, {
-        apply(target1, ctx1, args1) {
-          if (window.isMoved) {
-            // 仅当点击发生在触发滑动的元素内部时才抑制，避免误伤其他页面
-            const movedEl = (window as any).isMovedEl
-            if (movedEl && movedEl.contains && movedEl.contains(args1[0]?.target)) return
-            if (!movedEl) return // 没有记录元素则全局抑制（保持兼容）
-          }
-          try {
-            return target1.apply(ctx1, args1)
-          } catch (e) {
-            console.error(`[proxyPlayerEvent][${eventName}]`, listener, e)
-          }
-        }
-      })
+
+// A swipe can generate a synthetic click immediately after pointerup.  Keep
+// the suppression local to that one gesture instead of monkey-patching the
+// browser's EventTarget prototype (which breaks removeEventListener identity
+// and causes listener leaks in Vue/third-party components).
+document.addEventListener(
+  'click',
+  (event) => {
+    if (!window.isMoved) return
+    const movedEl = (window as any).isMovedEl as HTMLElement | null
+    if (movedEl?.contains?.(event.target as Node)) {
+      event.preventDefault()
+      event.stopImmediatePropagation()
     }
-    return target.apply(ctx, args)
-  }
-})
+  },
+  true
+)
 
 const vClick = useClick()
 const pinia = createPinia()

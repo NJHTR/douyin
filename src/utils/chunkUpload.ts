@@ -8,6 +8,7 @@
  */
 
 import { request } from '@/utils/request'
+import { completeUpload, presignUpload } from '@/api/user'
 
 const DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024 // 5MB
 
@@ -53,6 +54,55 @@ export class ChunkUploader {
   }
 
   async start(): Promise<ChunkUploadResult> {
+    try {
+      return await this.startDirectUpload()
+    } catch (directError) {
+      if (this.aborted) throw directError
+      // Keep the existing authenticated chunk path as a compatibility fallback
+      // while deployments roll out object-storage CORS for browser PUT.
+      return this.startChunkUpload()
+    }
+  }
+
+  private async startDirectUpload(): Promise<ChunkUploadResult> {
+    const contentType = this.file.type || 'video/mp4'
+    const signed = await presignUpload(this.file.name, contentType, this.file.size)
+    if (!signed.success || !signed.data?.uploadUrl || !signed.data?.objectKey) {
+      throw new Error(signed.msg || 'Direct upload is unavailable')
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('PUT', signed.data.uploadUrl, true)
+      xhr.setRequestHeader('Content-Type', contentType)
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          this.emit('progress', Math.min(99, Math.round((event.loaded / event.total) * 99)))
+        }
+      }
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) resolve()
+        else reject(new Error(`Object storage returned HTTP ${xhr.status}`))
+      }
+      xhr.onerror = () => reject(new Error('Direct upload network error'))
+      xhr.onabort = () => reject(new Error('Upload aborted'))
+      if (this.aborted) {
+        reject(new Error('Upload aborted'))
+        return
+      }
+      xhr.send(this.file)
+    })
+
+    const completed = await completeUpload(signed.data.objectKey, this.file.name)
+    if (!completed.success || !completed.data?.url) {
+      throw new Error(completed.msg || 'Upload verification failed')
+    }
+    this.emit('progress', 100)
+    this.emit('done', { url: completed.data.url })
+    return { url: completed.data.url }
+  }
+
+  private async startChunkUpload(): Promise<ChunkUploadResult> {
     const completed = new Array(this.totalChunks).fill(false)
 
     // 创建待上传队列
@@ -79,11 +129,12 @@ export class ChunkUploader {
           formData.append('totalChunks', String(this.totalChunks))
           formData.append('fileName', this.file.name)
 
-          await request({
+          const response = await request({
             url: '/upload/chunk',
             method: 'post',
             data: formData,
           })
+          if (!response.success) throw new Error(response.msg || `Chunk ${index} was rejected`)
 
           completed[index] = true
           doneCount++

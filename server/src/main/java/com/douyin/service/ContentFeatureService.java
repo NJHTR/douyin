@@ -17,6 +17,7 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.io.BufferedReader;
@@ -37,14 +38,32 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
     private final VideoTagService videoTagService;
     private final ObjectMapper objectMapper;
 
-    // 单线程串行队列 — 稳定优先，不限时间
-    private final LinkedBlockingQueue<Video> pendingQueue = new LinkedBlockingQueue<>();
+    // Bounded and ID-deduplicated so repeated callbacks cannot grow an
+    // unbounded in-memory backlog. Cross-instance claiming needs a schema
+    // migration and remains a separate batch.
+    private static final int MAX_PENDING_QUEUE = 4096;
+    private static final int MAX_RECOVERY_BATCH = 4096;
+    private static final int CLAIM_LEASE_SECONDS = 3600;
+    private final BlockingQueue<Video> pendingQueue = new ArrayBlockingQueue<>(MAX_PENDING_QUEUE);
+    private final Set<Long> pendingVideoIds = ConcurrentHashMap.newKeySet();
     private final ExecutorService workerExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "feature-extract-worker");
         t.setDaemon(true);
         return t;
     });
+    /** Bounded behavior queue keeps watch reporting off request threads. */
+    private final ThreadPoolExecutor behaviorExecutor = new ThreadPoolExecutor(
+            2, 4, 60, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(2048),
+            r -> {
+                Thread t = new Thread(r, "behavior-profile-worker");
+                t.setDaemon(true);
+                return t;
+            },
+            new ThreadPoolExecutor.AbortPolicy());
+    private final Object[] behaviorStripes = new Object[64];
     private final AtomicBoolean workerRunning = new AtomicBoolean(false);
+    private final AtomicBoolean recoveryRunning = new AtomicBoolean(false);
 
     private static final int MAX_RETRIES = RecommendationConfig.FEATURE_MAX_RETRIES;
     private static final long BASE_DELAY_MS = RecommendationConfig.FEATURE_BASE_DELAY_MS;
@@ -61,6 +80,7 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
         this.userProfileService = userProfileService;
         this.videoTagService = videoTagService;
         this.objectMapper = new ObjectMapper();
+        Arrays.setAll(behaviorStripes, ignored -> new Object());
     }
 
     // ===================== 生命周期 =====================
@@ -79,35 +99,47 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
     public void shutdown() {
         workerRunning.set(false);
         workerExecutor.shutdownNow();
+        behaviorExecutor.shutdownNow();
         log.info("特征提取后台线程已关闭, 队列残留={}", pendingQueue.size());
     }
 
     /** 启动时找出所有需要提取特征但还未成功的视频 */
     private void recoverPending() {
+        if (!recoveryRunning.compareAndSet(false, true)) return;
         try {
-            // 查找 extract_status 为 0(排队)/2(失败)/3(处理中) 的记录
-            List<VideoContent> pending = baseMapper.selectList(
-                    new LambdaQueryWrapper<VideoContent>()
-                            .in(VideoContent::getExtractStatus, 0, 2, 3));
-            for (VideoContent vc : pending) {
-                Video video = videoMapper.selectById(vc.getVideoId());
+            List<Long> recoverableIds = baseMapper.findRecoverableVideoIds(
+                    CLAIM_LEASE_SECONDS, MAX_RECOVERY_BATCH);
+            for (Long videoId : recoverableIds) {
+                Video video = videoMapper.selectById(videoId);
                 if (video != null) {
-                    pendingQueue.add(video);
+                    enqueuePending(video);
                     log.info("恢复未完成任务: videoId={}", video.getId());
                 }
             }
-            // 查找有 video 但没有 video_content 记录的作品
-            List<Long> existingIds = baseMapper.selectList(null).stream()
-                    .map(VideoContent::getVideoId).toList();
-            List<Video> allVideos = videoMapper.selectList(null);
-            for (Video v : allVideos) {
-                if (!existingIds.contains(v.getId())) {
-                    pendingQueue.add(v);
-                    log.info("恢复缺失特征: videoId={}", v.getId());
+
+            int remaining = Math.max(0, MAX_RECOVERY_BATCH - recoverableIds.size());
+            if (remaining > 0) {
+                for (Long videoId : baseMapper.findVideoIdsMissingContent(remaining)) {
+                    baseMapper.insertPendingIfAbsent(videoId);
+                    Video video = videoMapper.selectById(videoId);
+                    if (video != null) {
+                        enqueuePending(video);
+                        log.info("恢复缺失特征: videoId={}", video.getId());
+                    }
                 }
             }
         } catch (Exception e) {
             log.error("恢复未完成任务失败", e);
+        } finally {
+            recoveryRunning.set(false);
+        }
+    }
+
+    @Scheduled(fixedDelayString = "${douyin.feature.recovery-interval-ms:60000}",
+            initialDelayString = "${douyin.feature.recovery-initial-delay-ms:60000}")
+    void scheduledRecovery() {
+        if (workerRunning.get() && pendingQueue.remainingCapacity() > 0) {
+            recoverPending();
         }
     }
 
@@ -120,11 +152,11 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
         pending.setVideoId(video.getId());
         pending.setExtractStatus(0);
         try {
-            saveOrUpdate(pending);
+            baseMapper.insertPendingIfAbsent(video.getId());
         } catch (Exception e) {
             log.warn("写入排队状态失败: videoId={}", video.getId(), e);
         }
-        pendingQueue.add(video);
+        enqueuePending(video);
         log.info("已加入特征提取队列: videoId={} type={} 队列长度≈{}",
                 video.getId(), video.getType(), pendingQueue.size());
     }
@@ -137,7 +169,7 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
         reset.setVideoId(videoId);
         reset.setExtractStatus(0);
         saveOrUpdate(reset);
-        pendingQueue.add(video);
+        enqueuePending(video);
         log.info("手动重提特征提取: videoId={}", videoId);
         return true;
     }
@@ -154,7 +186,7 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
             if (video != null) {
                 vc.setExtractStatus(0);
                 saveOrUpdate(vc);
-                pendingQueue.add(video);
+                enqueuePending(video);
                 count++;
             }
         }
@@ -168,7 +200,7 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
                 vc.setVideoId(v.getId());
                 vc.setExtractStatus(0);
                 saveOrUpdate(vc);
-                pendingQueue.add(v);
+                enqueuePending(v);
                 count++;
             }
         }
@@ -179,7 +211,7 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
         for (VideoContent vc : stalled) {
             Video video = videoMapper.selectById(vc.getVideoId());
             if (video != null && !pendingQueue.contains(video)) {
-                pendingQueue.add(video);
+                enqueuePending(video);
                 count++;
             }
         }
@@ -199,8 +231,7 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
                 reset.setVideoId(v.getId());
                 reset.setExtractStatus(0);
                 saveOrUpdate(reset);
-                if (!pendingQueue.contains(v)) {
-                    pendingQueue.add(v);
+                if (enqueuePending(v)) {
                     count++;
                 }
             }
@@ -217,6 +248,27 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
         return status;
     }
 
+    /**
+     * Add one video to the bounded extraction queue. The ID set covers both
+     * queued and currently processing work, so duplicate callbacks cannot
+     * schedule the same video concurrently.
+     */
+    private boolean enqueuePending(Video video) {
+        if (video == null || video.getId() == null) {
+            return false;
+        }
+        Long videoId = video.getId();
+        if (!pendingVideoIds.add(videoId)) {
+            return false;
+        }
+        if (pendingQueue.offer(video)) {
+            return true;
+        }
+        pendingVideoIds.remove(videoId);
+        log.warn("特征提取队列已满，丢弃任务: videoId={} capacity={}", videoId, MAX_PENDING_QUEUE);
+        return false;
+    }
+
     // ===================== 后台工作线程 =====================
 
     private void workerLoop() {
@@ -225,7 +277,11 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
             try {
                 Video video = pendingQueue.poll(5, TimeUnit.SECONDS);
                 if (video == null) continue;
-                processOne(video);
+                try {
+                    processOne(video);
+                } finally {
+                    pendingVideoIds.remove(video.getId());
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
@@ -238,9 +294,12 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
 
     /** 处理单个视频，带指数退避重试 */
     private void processOne(Video video) {
+        if (baseMapper.tryClaim(video.getId(), CLAIM_LEASE_SECONDS) != 1) {
+            log.debug("特征提取任务已被其他实例领取或已完成: videoId={}", video.getId());
+            return;
+        }
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
-                updateStatus(video.getId(), 3, attempt);
                 log.info("开始特征提取: videoId={} type={} 第{}次尝试",
                         video.getId(), video.getType(), attempt);
 
@@ -638,6 +697,37 @@ public class ContentFeatureService extends ServiceImpl<VideoContentMapper, Video
                         String trafficSource, String sessionId, double swipeSeconds) {
         userProfileService.onWatch(userId, videoId, authorId,
                 watchDurationSec, videoDurationSec, trafficSource, sessionId, swipeSeconds);
+    }
+
+    /**
+     * Queue a profile update with bounded back pressure. A striped lock keeps
+     * updates for one user serialized on this instance, preventing local
+     * read-modify-write races while allowing unrelated users to proceed.
+     */
+    public boolean onWatchAsync(Long userId, Long videoId, Long authorId,
+                                double watchDurationSec, double videoDurationSec,
+                                String trafficSource, String sessionId, double swipeSeconds) {
+        if (userId == null || videoId == null) return false;
+        try {
+            behaviorExecutor.execute(() -> {
+                Object stripe = behaviorStripes[Math.floorMod(userId.hashCode(), behaviorStripes.length)];
+                synchronized (stripe) {
+                    try {
+                        onWatch(userId, videoId, authorId, watchDurationSec, videoDurationSec,
+                                trafficSource, sessionId, swipeSeconds);
+                    } catch (Exception e) {
+                        log.warn("异步画像更新失败: userId={} videoId={}: {}", userId, videoId, e.getMessage());
+                    }
+                }
+            });
+            return true;
+        } catch (RejectedExecutionException e) {
+            // The durable watch-history upsert already succeeded. Dropping a
+            // derived profile refresh is preferable to blocking the API pool.
+            log.warn("画像队列已满，丢弃本次增量: userId={} videoId={} queue={}",
+                    userId, videoId, behaviorExecutor.getQueue().size());
+            return false;
+        }
     }
 
     public void onLike(Long userId, Long videoId, Long authorId) {

@@ -53,6 +53,7 @@
         marginTop: state.subTypeVisible ? state.subTypeHeight : 0
       }"
       :api="trendingVideos"
+      :request-params="{ feedMode: 'HOT' }"
       @touchstart="pageClick"
     />
   </SlideItem>

@@ -25,8 +25,8 @@ public class SessionFilter implements Filter {
 
     private static final Set<String> WHITELIST = Set.of(
             "/api/login", "/api/register", "/api/email",
-            "/api/music", "/api/upload", "/api/file",
-            "/ws", "/api/admin",
+            "/api/file",
+            "/ws",
             "/api/session", "/api/search/suggestions",
             // RTC-003 webhook:签名鉴权
             "/api/rtc/webhook"

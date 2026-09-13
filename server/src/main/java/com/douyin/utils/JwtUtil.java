@@ -18,7 +18,19 @@ public class JwtUtil {
     public JwtUtil(
             @Value("${jwt.secret}") String secret,
             @Value("${jwt.expiration}") long expiration) {
-        this.key = Keys.hmacShaKeyFor(Base64.getDecoder().decode(secret));
+        if (secret == null || secret.isBlank()) {
+            throw new IllegalStateException("JWT_SECRET must be configured; refusing to start with an empty secret");
+        }
+        final byte[] decoded;
+        try {
+            decoded = Base64.getDecoder().decode(secret);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalStateException("JWT_SECRET must be valid base64", e);
+        }
+        if (decoded.length < 32) {
+            throw new IllegalStateException("JWT_SECRET must decode to at least 256 bits");
+        }
+        this.key = Keys.hmacShaKeyFor(decoded);
         this.expiration = expiration;
     }
 

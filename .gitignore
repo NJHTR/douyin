@@ -73,6 +73,9 @@ deploy/rtc/control/.env
 deploy/rtc/multi-vm/.env
 deploy/rtc/multi-vm/runtime/
 
+# Local P0 acceptance credentials
+deploy/p0/.env
+
 # Native streaming engine build output (CMake/Visual Studio artifacts)
 /streaming-engine/build/
 

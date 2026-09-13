@@ -12,6 +12,7 @@ import com.douyin.service.LiveMediaTokenService;
 import com.douyin.service.LivePresenceService;
 import com.douyin.service.LiveService;
 import com.douyin.utils.JwtUtil;
+import com.douyin.websocket.LiveStreamHandler;
 import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -53,7 +54,8 @@ class LiveControllerPresenceSessionTest {
                 mock(StreamingEngine.class),
                 mock(LiveMediaProperties.class),
                 mediaTokenService,
-                presenceService);
+                presenceService,
+                mock(LiveStreamHandler.class));
     }
 
     @Test

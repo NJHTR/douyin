@@ -5,6 +5,7 @@
       style="background: #000"
       :active="props.active"
       :api="recommendedVideo"
+      :request-params="{ feedMode: 'HOME' }"
     />
   </SlideItem>
 </template>

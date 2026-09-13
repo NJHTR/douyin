@@ -2,6 +2,7 @@ package com.douyin.service;
 
 import com.douyin.entity.LiveProviderSession;
 import com.douyin.mapper.LiveProviderSessionMapper;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -19,6 +20,7 @@ public class LiveProviderSessionService {
     private final LiveProviderSessionMapper mapper;
     private final Clock clock;
 
+    @Autowired
     public LiveProviderSessionService(LiveProviderSessionMapper mapper) {
         this(mapper, Clock.systemUTC());
     }

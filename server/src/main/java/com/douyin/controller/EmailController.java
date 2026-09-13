@@ -31,16 +31,26 @@ public class EmailController {
 
     /** 发送邮箱验证码 */
     @PostMapping("/send-code")
-    public Result<?> sendCode(@RequestBody Map<String, String> body) {
-        String email = body.get("email");
-        if (email == null || !email.contains("@")) {
+    public Result<?> sendCode(@RequestBody Map<String, String> body, HttpServletRequest req) {
+        String email = body.get("email") == null ? "" : body.get("email").trim().toLowerCase(java.util.Locale.ROOT);
+        String idempotencyKey = body.get("idempotency_key");
+        if (!email.matches("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$")) {
             return Result.fail("请输入有效邮箱");
         }
         try {
-            emailService.sendCode(email);
-            return Result.ok();
+            String ip = req.getRemoteAddr() == null ? "unknown" : req.getRemoteAddr();
+            // 按 IP + 邮箱组合限流，避免同一开发机/代理上的一个邮箱占满
+            // 所有用户共享的 10 分钟 IP 配额，同时仍保留 IP 维度的防刷能力。
+            if (!emailService.allowRequestFromIp(ip + "|" + email)) {
+                return Result.fail(429, "请求过于频繁，请稍后再试", Map.of("retryAfterSeconds", 600));
+            }
+            EmailService.SendCodeResult result = emailService.sendCode(email, idempotencyKey);
+            if (!result.accepted()) {
+                return Result.fail(429, "验证码已发送，请稍后再试", Map.of("retryAfterSeconds", result.retryAfterSeconds()));
+            }
+            return Result.ok(Map.of("retryAfterSeconds", result.retryAfterSeconds(), "duplicate", result.duplicate()));
         } catch (Exception e) {
-            return Result.fail("发送失败: " + e.getMessage());
+            return Result.fail("发送失败，请稍后重试");
         }
     }
 

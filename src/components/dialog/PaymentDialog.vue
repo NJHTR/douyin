@@ -84,7 +84,7 @@
         <div
           class="btn confirm"
           :class="{ disabled: !payMethod || (payMethod === 'wallet' && walletInsufficient) }"
-          @click="payMethod === 'wallet' ? doPay() : (step = 3)"
+          @click="continuePayment"
         >
           {{ payMethod === 'wallet' ? (walletInsufficient ? '余额不足' : '立即支付') : '确认支付' }}
         </div>
@@ -136,6 +136,7 @@ import { ref, computed } from 'vue'
 import { Icon } from '@iconify/vue'
 import { placeOrder, placeOrderFromCart, payOrder } from '@/api/user'
 import { getBalance } from '@/api/wallet'
+import { _notice } from '@/utils'
 
 defineOptions({ name: 'PaymentDialog' })
 
@@ -200,12 +201,20 @@ function show(payAmount: string, options?: { goods_id?: number; cart_ids?: numbe
 async function fetchWalletBalance() {
   try {
     const res: any = await getBalance()
+    if (!res.success) throw new Error(res.msg || res.message || '余额加载失败')
     if (res.data?.balance != null) walletBalance.value = Number(res.data.balance).toFixed(2)
-  } catch { /* ignore */ }
+  } catch (e: any) {
+    walletBalance.value = '0.00'
+    _notice(e?.message || '余额加载失败，请重试')
+  }
 }
 
 async function doPlaceOrder() {
   if (submitting.value) return
+  if (!receiverName.value.trim() || !receiverPhone.value.trim() || !receiverAddress.value.trim()) {
+    _notice('请完整填写收货信息')
+    return
+  }
   submitting.value = true
   try {
     const data = {
@@ -216,17 +225,22 @@ async function doPlaceOrder() {
     }
     if (mode.value === 'cart') {
       const res: any = await placeOrderFromCart({ ...data, cart_ids: cartIds.value } as any)
+      if (!res.success) throw new Error(res.msg || res.message || '提交订单失败')
       const orders = res.data || res
       orderIds.value = (Array.isArray(orders) ? orders : []).map((o: any) => o.id)
     } else {
       const res: any = await placeOrder({ ...data, goods_id: goodsId.value } as any)
+      if (!res.success) throw new Error(res.msg || res.message || '提交订单失败')
       const order = res.data || res
       orderIds.value = [order.id]
     }
+    if (!orderIds.value.length || orderIds.value.some((id) => !id)) {
+      throw new Error('订单创建结果异常，请稍后重试')
+    }
     await fetchWalletBalance()
     step.value = 2
-  } catch {
-    /* ignore */
+  } catch (e: any) {
+    _notice(e?.message || '提交订单失败，请重试')
   } finally {
     submitting.value = false
   }
@@ -236,6 +250,18 @@ function genIdempotencyKey(): string {
   return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
 }
 
+function continuePayment() {
+  if (!payMethod.value) {
+    _notice('请选择支付方式')
+    return
+  }
+  if (payMethod.value === 'wallet') {
+    void doPay()
+    return
+  }
+  step.value = 3
+}
+
 async function doPay() {
   if (paying.value) return
   if (payMethod.value === 'wallet' && walletInsufficient.value) return
@@ -243,11 +269,12 @@ async function doPay() {
   try {
     for (const id of orderIds.value) {
       const key = genIdempotencyKey()
-      await payOrder(id, payMethod.value, key)
+      const res = await payOrder(id, payMethod.value, key)
+      if (!res.success) throw new Error(res.msg || res.message || '支付失败')
     }
     step.value = 4
-  } catch {
-    /* ignore */
+  } catch (e: any) {
+    _notice(e?.message || '支付失败，请重试')
   } finally {
     paying.value = false
   }

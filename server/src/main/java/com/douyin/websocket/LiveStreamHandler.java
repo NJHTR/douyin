@@ -1,9 +1,15 @@
 package com.douyin.websocket;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.douyin.service.LiveHostPresenceService;
 import com.douyin.service.LiveService;
 import com.douyin.service.LivePresenceService;
 import com.douyin.entity.LiveRoom;
+import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
@@ -28,33 +34,70 @@ public class LiveStreamHandler extends TextWebSocketHandler {
 
     private final LiveService liveService;
     private final LivePresenceService livePresenceService;
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final WebSocketOutboundDispatcher outboundDispatcher;
+    private final ObjectMapper objectMapper;
+    private final LiveHostPresenceService hostPresenceService;
+    private final LiveRoomClusterBus clusterBus;
+    private final int endDelaySeconds;
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "live-control-maintenance");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     /** roomId → Set<WebSocketSession> */
-    private static final ConcurrentHashMap<Long, Set<WebSocketSession>> rooms = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, Set<WebSocketSession>> rooms = new ConcurrentHashMap<>();
     /** sessionId → roomId */
-    private static final ConcurrentHashMap<String, Long> sessionRoom = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> sessionRoom = new ConcurrentHashMap<>();
     /** sessionId → role (host/viewer) */
-    private static final ConcurrentHashMap<String, String> sessionRole = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> sessionRole = new ConcurrentHashMap<>();
     /** sessionId → userId (for host disconnect cleanup) */
-    private static final ConcurrentHashMap<String, Long> sessionUserId = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> sessionUserId = new ConcurrentHashMap<>();
     /** sessionId → (room,user,client presence session) */
-    private static final ConcurrentHashMap<String, String> presenceSession = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> presenceSession = new ConcurrentHashMap<>();
     /** roomId → 延迟关播任务（主播断线 30s 后才真正关播，给重连留机会） */
     private final ConcurrentHashMap<Long, ScheduledFuture<?>> pendingEnds = new ConcurrentHashMap<>();
 
-    /** 主播断线后延迟关播的秒数 */
-    private static final int END_DELAY_SECONDS = 30;
-
+    /** Compatibility constructor for direct unit-test/integration construction. */
     public LiveStreamHandler(LiveService liveService, LivePresenceService livePresenceService) {
-        this.liveService = liveService;
-        this.livePresenceService = livePresenceService;
+        this(liveService, livePresenceService,
+                new WebSocketOutboundDispatcher(8, 4096, 256), new ObjectMapper());
     }
 
-    public static int getViewerCount(Long roomId) {
-        Set<WebSocketSession> set = rooms.get(roomId);
-        if (set == null) return 0;
-        return (int) set.stream().filter(s -> "viewer".equals(sessionRole.get(s.getId()))).count();
+    public LiveStreamHandler(LiveService liveService, LivePresenceService livePresenceService,
+                             WebSocketOutboundDispatcher outboundDispatcher,
+                             ObjectMapper objectMapper) {
+        this(liveService, livePresenceService, outboundDispatcher, objectMapper, null, null, 30);
+    }
+
+    private LiveStreamHandler(LiveService liveService, LivePresenceService livePresenceService,
+                              WebSocketOutboundDispatcher outboundDispatcher,
+                              ObjectMapper objectMapper,
+                              LiveHostPresenceService hostPresenceService,
+                              LiveRoomClusterBus clusterBus,
+                              int endDelaySeconds) {
+        this.liveService = liveService;
+        this.livePresenceService = livePresenceService;
+        this.outboundDispatcher = outboundDispatcher;
+        this.objectMapper = objectMapper;
+        this.hostPresenceService = hostPresenceService;
+        this.clusterBus = clusterBus;
+        this.endDelaySeconds = Math.max(1, Math.min(endDelaySeconds, 300));
+    }
+
+    @Autowired
+    public LiveStreamHandler(LiveService liveService, LivePresenceService livePresenceService,
+                             WebSocketOutboundDispatcher outboundDispatcher,
+                             ObjectMapper objectMapper,
+                             LiveHostPresenceService hostPresenceService,
+                             ObjectProvider<LiveRoomClusterBus> clusterBus,
+                             @Value("${live.control.host-disconnect-grace-seconds:30}") int endDelaySeconds,
+                             @Value("${live.control.host-lease-refresh-seconds:5}") int leaseRefreshSeconds) {
+        this(liveService, livePresenceService, outboundDispatcher, objectMapper,
+                hostPresenceService, clusterBus.getIfAvailable(), endDelaySeconds);
+        int refreshSeconds = Math.max(2, Math.min(leaseRefreshSeconds, 15));
+        scheduler.scheduleAtFixedRate(this::refreshHostLeases,
+                refreshSeconds, refreshSeconds, TimeUnit.SECONDS);
     }
 
     @Override
@@ -67,7 +110,8 @@ public class LiveStreamHandler extends TextWebSocketHandler {
             return;
         }
         LiveRoom room = liveService.getById(roomId);
-        if (room == null || (!"LIVE".equals(room.getStatus()) && !"host".equals(role))) {
+        if (room == null || ("viewer".equals(role) && !"LIVE".equals(room.getStatus()))
+                || ("host".equals(role) && !isHostConnectableRoom(room))) {
             closeSession(session);
             return;
         }
@@ -107,10 +151,12 @@ public class LiveStreamHandler extends TextWebSocketHandler {
         }
 
         rooms.computeIfAbsent(roomId, k -> ConcurrentHashMap.newKeySet()).add(session);
+        outboundDispatcher.register(session);
         log.info("Live WS connected: roomId={}, role={}, viewers={}", roomId, role, viewerCount(roomId));
 
         // 主播重连 → 取消延迟关播任务
         if ("host".equals(role)) {
+            if (hostPresenceService != null) hostPresenceService.touch(roomId, session.getId());
             ScheduledFuture<?> pending = pendingEnds.remove(roomId);
             if (pending != null) {
                 pending.cancel(false);
@@ -134,12 +180,9 @@ public class LiveStreamHandler extends TextWebSocketHandler {
         }
 
         String payload = message.getPayload();
-        Set<WebSocketSession> set = rooms.get(roomId);
-        if (set == null) return;
-
         String role = sessionRole.get(session.getId());
         try {
-            var obj = new com.fasterxml.jackson.databind.ObjectMapper().readTree(payload);
+            var obj = objectMapper.readTree(payload);
             String type = obj.has("type") ? obj.get("type").asText() : "";
             // Media is never transported over the control WebSocket. Clients
             // must use SRS WHIP/WHEP; silently dropping legacy frame packets
@@ -153,6 +196,9 @@ public class LiveStreamHandler extends TextWebSocketHandler {
                     broadcastRoomStatus(roomId);
                 }
                 return;
+            }
+            if ("host".equals(role) && hostPresenceService != null) {
+                hostPresenceService.touch(roomId, session.getId());
             }
             if ("host".equals(role) && !"chat".equals(type)) return;
             if ("viewer".equals(role) && !"chat".equals(type) && !"like".equals(type)) return;
@@ -171,26 +217,33 @@ public class LiveStreamHandler extends TextWebSocketHandler {
         // Chat/like are broadcast as control events only. The sender receives
         // the same event so all clients share one display projection; media
         // bytes never enter this loop.
-        for (WebSocketSession s : set) {
-            if (s.isOpen()) {
-                try {
-                    s.sendMessage(new TextMessage(payload));
-                } catch (IOException ignored) {
-                }
-            }
-        }
+        broadcastRoomEvent(roomId, payload, false);
     }
 
     /** Notify control clients that the provider room ended, then release sockets. */
-    public static void broadcastEnd(Long roomId) {
+    public void broadcastEnd(Long roomId) {
+        broadcastRoomEvent(roomId, "{\"type\":\"end\"}", true);
+    }
+
+    /** Called by the Redis room subscriber; it must never publish again. */
+    public void deliverClusterEvent(Long roomId, String payload, boolean closeAfter) {
+        deliverLocal(roomId, payload, closeAfter);
+    }
+
+    private void broadcastRoomEvent(Long roomId, String payload, boolean closeAfter) {
+        deliverLocal(roomId, payload, closeAfter);
+        if (clusterBus != null) clusterBus.publish(roomId, payload, closeAfter);
+    }
+
+    private void deliverLocal(Long roomId, String payload, boolean closeAfter) {
         Set<WebSocketSession> set = rooms.get(roomId);
         if (set == null) return;
         for (WebSocketSession session : set.toArray(new WebSocketSession[0])) {
             if (!session.isOpen()) continue;
-            try {
-                session.sendMessage(new TextMessage("{\"type\":\"end\"}"));
-                session.close(CloseStatus.NORMAL);
-            } catch (IOException ignored) {
+            if (closeAfter) {
+                outboundDispatcher.sendAndClose(session, payload, CloseStatus.NORMAL);
+            } else {
+                outboundDispatcher.send(session, payload);
             }
         }
     }
@@ -209,7 +262,18 @@ public class LiveStreamHandler extends TextWebSocketHandler {
         String role = sessionRole.remove(session.getId());
         Long userId = sessionUserId.remove(session.getId());
 
-        // 主播断线 → 延迟 30s 关播，给重连留机会
+        if (roomId != null) {
+            Set<WebSocketSession> set = rooms.get(roomId);
+            if (set != null) {
+                set.remove(session);
+                if (set.isEmpty()) rooms.remove(roomId, set);
+            }
+        }
+        if ("host".equals(role) && roomId != null && hostPresenceService != null) {
+            hostPresenceService.leave(roomId, session.getId());
+        }
+
+        // 主播断线 → 延迟关播，给重连留机会；最终判断使用共享 lease。
         if ("host".equals(role) && roomId != null && userId != null) {
             ScheduledFuture<?> existing = pendingEnds.get(roomId);
             if (existing != null) {
@@ -217,31 +281,14 @@ public class LiveStreamHandler extends TextWebSocketHandler {
             }
             ScheduledFuture<?> future = scheduler.schedule(() -> {
                 pendingEnds.remove(roomId);
-                try {
-                    // 再次确认该房间没有活跃的 host 连接
-                    Set<WebSocketSession> sessions = rooms.get(roomId);
-                    boolean hostOnline = sessions != null && sessions.stream()
-                            .anyMatch(s -> s.isOpen() && "host".equals(sessionRole.get(s.getId())));
-                    LiveRoom current = liveService.getById(roomId);
-                    if (!hostOnline && current != null && "LIVE".equals(current.getStatus())) {
-                        liveService.endLive(roomId, userId);
-                        broadcastEnd(roomId);
-                        log.info("Auto-ended live room {} after {}s delay, userId={}", roomId, END_DELAY_SECONDS, userId);
-                    }
-                } catch (Exception e) {
-                    log.error("Failed to auto-end room {}: {}", roomId, e.getMessage());
-                }
-            }, END_DELAY_SECONDS, TimeUnit.SECONDS);
+                autoEndIfHostAbsent(roomId, userId);
+            }, endDelaySeconds, TimeUnit.SECONDS);
             pendingEnds.put(roomId, future);
-            log.info("Host disconnected, scheduling auto-end for room {} in {}s", roomId, END_DELAY_SECONDS);
+            log.info("Host disconnected, scheduling auto-end for room {} in {}s", roomId, endDelaySeconds);
         }
 
         if (roomId != null) {
-            Set<WebSocketSession> set = rooms.get(roomId);
-            if (set != null) {
-                set.remove(session);
-                if (set.isEmpty()) rooms.remove(roomId);
-            }
+            outboundDispatcher.unregister(session);
             // Presence is TTL based. Do not delete immediately here: a browser
             // reconnect may close the old socket after the new one is active.
             presenceSession.remove(session.getId());
@@ -253,14 +300,63 @@ public class LiveStreamHandler extends TextWebSocketHandler {
     private void broadcastRoomStatus(Long roomId) {
         int count = viewerCount(roomId);
         String msg = "{\"type\":\"viewer_count\",\"count\":" + count + "}";
-        Set<WebSocketSession> set = rooms.get(roomId);
-        if (set != null) {
-            for (WebSocketSession s : set) {
-                if (s.isOpen()) {
-                    try { s.sendMessage(new TextMessage(msg)); } catch (IOException ignored) {}
+        broadcastRoomEvent(roomId, msg, false);
+    }
+
+    private void refreshHostLeases() {
+        if (hostPresenceService == null) return;
+        try {
+            rooms.forEach((roomId, sessions) -> sessions.forEach(session -> {
+                if (session.isOpen() && "host".equals(sessionRole.get(session.getId()))) {
+                    hostPresenceService.touch(roomId, session.getId());
+                }
+            }));
+        } catch (RuntimeException e) {
+            log.warn("Failed to refresh local live host leases: {}", e.getMessage());
+        }
+    }
+
+    private boolean hasLocalHost(Long roomId) {
+        Set<WebSocketSession> sessions = rooms.get(roomId);
+        return sessions != null && sessions.stream()
+                .anyMatch(s -> s.isOpen() && "host".equals(sessionRole.get(s.getId())));
+    }
+
+    void autoEndIfHostAbsent(Long roomId, Long userId) {
+        try {
+            boolean hostOnline = hostPresenceService == null
+                    ? hasLocalHost(roomId) : hostPresenceService.hasActiveHost(roomId);
+            LiveRoom current = liveService.getById(roomId);
+            if (hostOnline || !isActiveRoom(current)) return;
+            String lockToken = hostPresenceService == null
+                    ? "local" : hostPresenceService.tryAcquireEndLock(roomId);
+            if (lockToken == null) return;
+            try {
+                if (hostPresenceService != null && hostPresenceService.hasActiveHost(roomId)) return;
+                LiveRoom ended = liveService.endLive(roomId, userId);
+                if (ended != null && ("ENDING".equals(ended.getStatus())
+                        || "ENDED".equals(ended.getStatus()))) {
+                    broadcastEnd(roomId);
+                    log.info("Auto-ended live room {} after {}s delay, userId={}",
+                            roomId, endDelaySeconds, userId);
+                }
+            } finally {
+                if (hostPresenceService != null) {
+                    hostPresenceService.releaseEndLock(roomId, lockToken);
                 }
             }
+        } catch (Exception e) {
+            log.error("Failed to auto-end room {}: {}", roomId, e.getMessage());
         }
+    }
+
+    private static boolean isActiveRoom(LiveRoom room) {
+        return room != null && ("STARTING".equals(room.getStatus())
+                || "LIVE".equals(room.getStatus()) || "DEGRADED".equals(room.getStatus()));
+    }
+
+    private static boolean isHostConnectableRoom(LiveRoom room) {
+        return room != null && ("PREVIEW".equals(room.getStatus()) || isActiveRoom(room));
     }
 
     private Long extractRoomId(WebSocketSession session) {
@@ -309,5 +405,12 @@ public class LiveStreamHandler extends TextWebSocketHandler {
 
     private void closeSession(WebSocketSession session) {
         try { session.close(); } catch (IOException ignored) {}
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        pendingEnds.values().forEach(task -> task.cancel(false));
+        pendingEnds.clear();
+        scheduler.shutdownNow();
     }
 }

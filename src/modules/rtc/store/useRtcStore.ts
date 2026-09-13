@@ -15,7 +15,7 @@ import {
 import { sendCallSignal } from '@/utils/socket'
 import { useBaseStore } from '@/store/pinia'
 import { _notice } from '@/utils'
-import { startCallRingtone, stopCallRingtone } from '@/utils/notificationFeedback'
+import { playSound, startCallRingtone, stopCallRingtone } from '@/utils/notificationFeedback'
 import { rtcMediaPort } from '@/modules/rtc/adapter/livekitAdapter'
 import {
   ACCEPTING_CALL_STATES,
@@ -155,6 +155,7 @@ export const useRtcStore = defineStore('rtc', {
     /** 开始主叫/被叫振铃；倒计时始终以服务端 expires_at 为准。 */
     beginRinging(role: 'outgoing' | 'incoming', expiresAt?: string | null) {
       ringingTimer = clearTimer(ringingTimer)
+      void playSound('call.incoming', { eventId: `${role}:${this.session?.call_id || this.incoming?.callId || 'pending'}` })
       startCallRingtone()
       const configuredRemaining = expiresAt ? new Date(expiresAt).getTime() - Date.now() : 0
       const timeoutMs = configuredRemaining > 0 ? configuredRemaining : 180_000
@@ -407,6 +408,7 @@ export const useRtcStore = defineStore('rtc', {
       if (!payload.callId || this.session?.call_id !== payload.callId) return
       if (this.phase !== 'dialing' && this.phase !== 'connecting') return
       _notice('对方正在通话中')
+      void playSound('call.busy', { eventId: payload.callId })
       const callId = this.session.call_id
       try {
         await cancelCall(callId, {
@@ -432,6 +434,7 @@ export const useRtcStore = defineStore('rtc', {
       const incomingCallId = this.incoming.callId
       this.stopRinging()
       this.phase = 'connecting'
+      void playSound('call.connecting', { eventId: incomingCallId })
       const res = await acceptCall(incomingCallId, {
         event_id: genEventId('accept'),
         trace_id: this.traceId || undefined,
@@ -474,6 +477,7 @@ export const useRtcStore = defineStore('rtc', {
     /** 被叫方:拒绝 */
     async reject() {
       this.stopRinging()
+      void playSound('call.rejected', { eventId: this.incoming?.callId || 'incoming' })
       if (this.incoming?.callId) {
         const res = await rejectCall(this.incoming.callId, {
           event_id: genEventId('reject'),
@@ -618,6 +622,7 @@ export const useRtcStore = defineStore('rtc', {
         if (this.phase === 'connecting' || this.phase === 'reconnecting') {
           this.phase = 'connected'
           this.startDuration()
+          void playSound('call.connected', { eventId: this.session?.call_id || 'connected' })
         }
         this.reconnectCount = 0
         reconnectTimer = clearTimer(reconnectTimer)
@@ -625,6 +630,7 @@ export const useRtcStore = defineStore('rtc', {
       }
       if (this.phase !== 'connected' && this.phase !== 'reconnecting') return
       this.phase = 'reconnecting'
+      void playSound('call.reconnecting', { eventId: this.session?.call_id || 'reconnecting' })
       this.scheduleReconnect(1)
     },
 
@@ -777,7 +783,8 @@ export const useRtcStore = defineStore('rtc', {
     },
 
     finishEnded(reason: string | null) {
-      void reason
+      const endEvent: 'call.busy' | 'call.timeout' | 'call.rejected' | 'call.ended' = reason === 'BUSY' ? 'call.busy' : reason === 'TIMEOUT' ? 'call.timeout' : reason === 'REJECTED' ? 'call.rejected' : 'call.ended'
+      void playSound(endEvent, { eventId: `${this.session?.call_id || 'call'}:${reason || 'ended'}` })
       this.stopRinging()
       lifecycleGeneration++
       joining = false

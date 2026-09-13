@@ -46,11 +46,8 @@ public class FileService {
     }
 
     private String upload(MultipartFile file, String bucket, String contentType) throws Exception {
-        // 确保 bucket 存在
-        boolean found = minioClient.bucketExists(BucketExistsArgs.builder().bucket(bucket).build());
-        if (!found) {
-            minioClient.makeBucket(MakeBucketArgs.builder().bucket(bucket).build());
-        }
+        if (file == null || file.isEmpty()) throw new IllegalArgumentException("文件不能为空");
+        ensureBucket(bucket);
 
         String ext = getExtension(file.getOriginalFilename());
         String objectName = UUID.randomUUID() + ext;
@@ -76,10 +73,7 @@ public class FileService {
 
     /** 上传本地文件到 MinIO 并返回预签名 URL */
     public String uploadLocalFile(Path filePath, String bucket, String contentType) throws Exception {
-        boolean found = minioClient.bucketExists(BucketExistsArgs.builder().bucket(bucket).build());
-        if (!found) {
-            minioClient.makeBucket(MakeBucketArgs.builder().bucket(bucket).build());
-        }
+        ensureBucket(bucket);
 
         String ext = getExtension(filePath.getFileName().toString());
         String objectName = UUID.randomUUID() + ext;
@@ -128,5 +122,16 @@ public class FileService {
                         .object(objectName)
                         .build()
         );
+    }
+
+    /** Idempotent bucket bootstrap shared by proxied and direct uploads. */
+    public void ensureBucket(String bucket) throws Exception {
+        if (minioClient.bucketExists(BucketExistsArgs.builder().bucket(bucket).build())) return;
+        try {
+            minioClient.makeBucket(MakeBucketArgs.builder().bucket(bucket).build());
+        } catch (Exception e) {
+            // Another API replica may have created it after our exists check.
+            if (!minioClient.bucketExists(BucketExistsArgs.builder().bucket(bucket).build())) throw e;
+        }
     }
 }

@@ -3,12 +3,17 @@ package com.douyin.controller;
 import com.douyin.common.Result;
 import com.douyin.entity.Music;
 import com.douyin.service.MusicService;
+import com.douyin.service.RedisCacheService;
+import com.douyin.service.UploadPolicy;
+import com.douyin.utils.JwtUtil;
+import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 import java.util.Map;
+import java.time.Duration;
 
 @Slf4j
 @RestController
@@ -16,9 +21,13 @@ import java.util.Map;
 public class MusicController {
 
     private final MusicService musicService;
+    private final JwtUtil jwtUtil;
+    private final RedisCacheService redisCacheService;
 
-    public MusicController(MusicService musicService) {
+    public MusicController(MusicService musicService, JwtUtil jwtUtil, RedisCacheService redisCacheService) {
         this.musicService = musicService;
+        this.jwtUtil = jwtUtil;
+        this.redisCacheService = redisCacheService;
     }
 
     /** 搜索本地曲库 */
@@ -60,8 +69,24 @@ public class MusicController {
             @RequestParam("file") MultipartFile file,
             @RequestParam(defaultValue = "") String name,
             @RequestParam(defaultValue = "") String artist,
-            @RequestParam(defaultValue = "") String album) {
+            @RequestParam(defaultValue = "") String album,
+            HttpServletRequest request) {
+        String auth = request.getHeader("Authorization");
+        if (auth == null || !auth.startsWith("Bearer ") || !jwtUtil.validateToken(auth.substring(7))) {
+            return Result.fail("请先登录");
+        }
+        Long userId;
         try {
+            userId = jwtUtil.getUserIdFromToken(auth.substring(7));
+        } catch (Exception e) {
+            return Result.fail("请先登录");
+        }
+        if (userId == null || !redisCacheService.rateLimit("upload:music", String.valueOf(userId),
+                30, Duration.ofMinutes(1))) {
+            return Result.fail(429, "上传请求过于频繁，请稍后再试");
+        }
+        try {
+            UploadPolicy.validateMultipart(file, UploadPolicy.Kind.VOICE);
             Music music = musicService.upload(file, name, artist, album);
             return Result.ok(music);
         } catch (Exception e) {

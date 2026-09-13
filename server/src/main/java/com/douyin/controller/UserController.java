@@ -12,6 +12,7 @@ import com.douyin.entity.Friend;
 import com.douyin.mapper.FollowMapper;
 import com.douyin.mapper.FriendMapper;
 import com.douyin.service.ContentFeatureService;
+import com.douyin.service.NotificationDispatchService;
 import com.douyin.service.SystemNoticeService;
 import com.douyin.service.UserService;
 import com.douyin.service.VideoService;
@@ -25,6 +26,8 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @Slf4j
 @RestController
@@ -39,12 +42,14 @@ public class UserController {
     private final MessagePublisher messagePublisher;
     private final ContentFeatureService contentFeatureService;
     private final SystemNoticeService systemNoticeService;
+    private final NotificationDispatchService notificationDispatchService;
 
     public UserController(UserService userService, VideoService videoService, JwtUtil jwtUtil,
                           FollowMapper followMapper, FriendMapper friendMapper,
                           MessagePublisher messagePublisher,
                           ContentFeatureService contentFeatureService,
-                          SystemNoticeService systemNoticeService) {
+                          SystemNoticeService systemNoticeService,
+                          NotificationDispatchService notificationDispatchService) {
         this.userService = userService;
         this.videoService = videoService;
         this.jwtUtil = jwtUtil;
@@ -53,6 +58,7 @@ public class UserController {
         this.messagePublisher = messagePublisher;
         this.contentFeatureService = contentFeatureService;
         this.systemNoticeService = systemNoticeService;
+        this.notificationDispatchService = notificationDispatchService;
     }
 
     /** 从请求头提取当前登录用户, 未登录返回 null */
@@ -286,20 +292,19 @@ public class UserController {
         if (loginUserId == null) return Result.fail("请先登录");
         boolean followed = userService.toggleFollow(loginUserId, userId);
 
-        // 更新用户画像
-        try { contentFeatureService.onFollow(loginUserId, userId); } catch (Exception ignored) {}
+        // Only a successful follow is positive evidence.  An unfollow must not
+        // refresh creator affinity or social-engagement features as if the user
+        // had followed again.
+        if (followed) {
+            try { contentFeatureService.onFollow(loginUserId, userId); } catch (Exception ignored) {}
+        }
 
         // 关注通知 → 异步发 Kafka，避免阻塞 HTTP 请求
         if (followed) {
             final Long fUserId = userId, fLoginUserId = loginUserId;
-            final com.douyin.kafka.MessagePublisher pub = messagePublisher;
-            java.util.concurrent.CompletableFuture.runAsync(() -> {
-                try {
-                    pub.publishNotification(new NotificationEvent(
-                            fUserId, fLoginUserId, NotificationVO.TYPE_FOLLOW,
-                            null, null, "关注了你", System.currentTimeMillis(), null));
-                } catch (Exception ignored) {}
-            });
+            notificationDispatchService.dispatch(new NotificationEvent(
+                    fUserId, fLoginUserId, NotificationVO.TYPE_FOLLOW,
+                    null, null, "关注了你", System.currentTimeMillis(), null));
         }
 
         return Result.ok(Map.of("isAttention", followed));
@@ -318,8 +323,51 @@ public class UserController {
 
     /** 搜索用户 */
     @GetMapping("/search")
-    public Result<List<UserVO>> search(@RequestParam String keyword) {
-        return Result.ok(userService.searchUsers(keyword));
+    public Result<List<UserVO>> search(@RequestParam String keyword, HttpServletRequest req) {
+        Long loginUserId = getLoginUserId(req);
+        List<UserVO> results = userService.searchUsers(keyword);
+        if (loginUserId == null) return Result.ok(results);
+
+        List<Long> targetIds = results.stream()
+                .map(UserVO::getUid)
+                .filter(uid -> uid != null && !uid.equals(loginUserId))
+                .distinct()
+                .toList();
+        if (targetIds.isEmpty()) return Result.ok(results);
+
+        List<Follow> relations = followMapper.selectList(new LambdaQueryWrapper<Follow>()
+                .and(w -> w.and(a -> a.eq(Follow::getUserId, loginUserId).in(Follow::getFollowId, targetIds))
+                        .or(a -> a.eq(Follow::getFollowId, loginUserId).in(Follow::getUserId, targetIds))));
+        Set<Long> followedIds = relations.stream()
+                .filter(f -> loginUserId.equals(f.getUserId()))
+                .map(Follow::getFollowId)
+                .collect(Collectors.toSet());
+        Set<Long> followingMeIds = relations.stream()
+                .filter(f -> loginUserId.equals(f.getFollowId()))
+                .map(Follow::getUserId)
+                .collect(Collectors.toSet());
+
+        List<Friend> friendRelations = friendMapper.selectList(new LambdaQueryWrapper<Friend>()
+                .and(w -> w.and(a -> a.eq(Friend::getUserId, loginUserId).in(Friend::getFriendId, targetIds))
+                        .or(a -> a.eq(Friend::getFriendId, loginUserId).in(Friend::getUserId, targetIds))));
+        Set<Long> friendIds = friendRelations.stream()
+                .filter(f -> Integer.valueOf(1).equals(f.getStatus()))
+                .map(f -> loginUserId.equals(f.getUserId()) ? f.getFriendId() : f.getUserId())
+                .collect(Collectors.toSet());
+        Set<Long> requestedIds = friendRelations.stream()
+                .filter(f -> Integer.valueOf(0).equals(f.getStatus()) && loginUserId.equals(f.getUserId()))
+                .map(Friend::getFriendId)
+                .collect(Collectors.toSet());
+
+        for (UserVO vo : results) {
+            Long targetId = vo.getUid();
+            if (targetId == null || targetId.equals(loginUserId)) continue;
+            vo.setIsFollowed(followedIds.contains(targetId));
+            vo.setIsFollowingMe(followingMeIds.contains(targetId));
+            vo.setIsFriend(friendIds.contains(targetId));
+            vo.setFriendRequestSent(requestedIds.contains(targetId));
+        }
+        return Result.ok(results);
     }
 
     /** 最近常看：根据互动历史获取最近关注的作者 */

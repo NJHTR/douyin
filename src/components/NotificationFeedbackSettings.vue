@@ -19,6 +19,10 @@
           <span>震动</span>
           <input v-model="draft.vibrationEnabled" type="checkbox" @change="save" />
         </label>
+        <label class="feedback-switch-row">
+          <span>减少反馈</span>
+          <input v-model="draft.reducedFeedback" type="checkbox" @change="save" />
+        </label>
 
         <label class="feedback-field">
           <span>声音音量 {{ Math.round(draft.volume * 100) }}%</span>
@@ -110,6 +114,7 @@ function save() {
     enabled: draft.enabled,
     soundEnabled: draft.soundEnabled,
     vibrationEnabled: draft.vibrationEnabled,
+    reducedFeedback: draft.reducedFeedback,
     volume: draft.volume
   })
 }

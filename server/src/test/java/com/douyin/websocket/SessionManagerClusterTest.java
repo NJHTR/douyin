@@ -22,7 +22,7 @@ class SessionManagerClusterTest {
 
     @Test
     void pushDeliversLocallyAndPublishesToOtherNodes() throws Exception {
-        SessionManager manager = new SessionManager();
+        SessionManager manager = manager();
         WebSocketClusterBus bus = mock(WebSocketClusterBus.class);
         WebSocketSession socket = mock(WebSocketSession.class);
         when(socket.getId()).thenReturn("device-a");
@@ -38,7 +38,7 @@ class SessionManagerClusterTest {
 
     @Test
     void localDeliveryDoesNotRepublish() throws Exception {
-        SessionManager manager = new SessionManager();
+        SessionManager manager = manager();
         WebSocketClusterBus bus = mock(WebSocketClusterBus.class);
         WebSocketSession socket = mock(WebSocketSession.class);
         when(socket.getId()).thenReturn("device-b");
@@ -74,5 +74,9 @@ class SessionManagerClusterTest {
     private static DefaultMessage message(String body) {
         return new DefaultMessage("fanout".getBytes(StandardCharsets.UTF_8),
                 body.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static SessionManager manager() {
+        return new SessionManager(new WebSocketOutboundDispatcher(Runnable::run, 16));
     }
 }

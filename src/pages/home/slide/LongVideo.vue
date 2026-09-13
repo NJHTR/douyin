@@ -24,7 +24,11 @@ watch(
         let el = playingEl.value
         if (el) {
           el.parentNode.parentNode.classList.remove('pause')
-          el.play()
+          el.play().catch(() => {
+            el.muted = true
+            state.muted = true
+            return el.play().catch(() => {})
+          })
         }
       } else {
         state.show = true
@@ -55,7 +59,11 @@ const vIsCanPlay = {
             }
           })
           el.parentNode.parentNode.classList.remove('pause')
-          el.play()
+          el.play().catch(() => {
+            el.muted = true
+            state.muted = true
+            return el.play().catch(() => {})
+          })
           playingEl.value = el
         } else {
           el.parentNode.parentNode.classList.add('pause')
@@ -79,7 +87,12 @@ const nav = useNav()
 
 <template>
   <div class="long-video" @dragstart="(e) => _stopPropagation(e)">
-    <ScrollList class="Scroll" v-if="state.show" :api="recommendedLongVideo">
+    <ScrollList
+      class="Scroll"
+      v-if="state.show"
+      :api="recommendedLongVideo"
+      :api-params="{ feedMode: 'LONG_VIDEO' }"
+    >
       <template v-slot="{ list }">
         <div class="empty" v-if="list.length === 0">
           <img src="@/assets/img/icon/none-bg1.webp" alt="" />
@@ -99,7 +112,7 @@ const nav = useNav()
           >
             <div class="video-wrapper" v-if="i % 9 === 0">
               <video
-                muted
+                :muted="state.muted"
                 preload
                 loop
                 x5-video-player-type="h5-page"

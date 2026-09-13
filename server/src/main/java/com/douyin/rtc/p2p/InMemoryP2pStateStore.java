@@ -1,5 +1,7 @@
 package com.douyin.rtc.p2p;
 
+import org.springframework.stereotype.Component;
+
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -7,6 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * 单实例内存 state store(状态转移与 consent 均以 CAS/计算守卫保护,重复 event_id 幂等)。
  * 多实例拓扑需 Redis 化,见 RTC-015 not_run 记录。
  */
+@Component
 public class InMemoryP2pStateStore implements P2pStateStore {
 
     private final Map<String, String> statuses = new ConcurrentHashMap<>();

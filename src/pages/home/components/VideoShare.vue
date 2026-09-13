@@ -168,7 +168,7 @@ export default {
           if (this.needDown) _stopPropagation(e)
           else return
           if (this.progress === 100) {
-            _notice('未实现分享跳转到其他App')
+            _notice('外部应用分享即将上线')
           } else {
             this.loading = true
             let interval = setInterval(() => {
@@ -179,7 +179,7 @@ export default {
                 this.loading = false
                 this.$emit('click')
                 this.$emit('click')
-                _notice('未实现分享跳转到其他App')
+                _notice('外部应用分享即将上线')
               }
             }, 10)
           }

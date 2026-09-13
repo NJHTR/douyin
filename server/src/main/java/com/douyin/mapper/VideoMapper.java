@@ -71,7 +71,7 @@ public interface VideoMapper extends BaseMapper<Video> {
             ") r JOIN t_video v ON v.id = r.video_id " +
             "WHERE v.status = 'APPROVED' AND v.is_delete = 0 AND v.author_user_id != #{userId} " +
             "GROUP BY v.author_user_id " +
-            "ORDER BY MAX(r.create_time) DESC LIMIT #{limit}")
+            "ORDER BY MAX(r.create_time) DESC, v.author_user_id DESC LIMIT #{limit}")
     List<Long> findRecentAuthorIds(@Param("userId") Long userId, @Param("limit") int limit);
 
     /** 召回用: 按品类查询视频(排除已曝光), 有内容特征的优先 */
@@ -82,17 +82,25 @@ public interface VideoMapper extends BaseMapper<Video> {
             "AND v.id NOT IN <foreach collection='excludeIds' item='id' open='(' separator=',' close=')'>#{id}</foreach> " +
             "</if>" +
             "<if test='minDuration != null'>AND v.duration >= #{minDuration}</if> " +
-            "ORDER BY (CASE WHEN vc.extract_status = 1 THEN 0 ELSE 1 END), v.create_time DESC " +
+            "ORDER BY (CASE WHEN vc.extract_status = 1 THEN 0 ELSE 1 END), v.create_time DESC, v.id ASC " +
             "LIMIT #{limit}</script>")
     List<Video> findRecallCandidates(@Param("excludeIds") List<Long> excludeIds,
                                       @Param("minDuration") Double minDuration,
                                       @Param("limit") int limit);
 
-    /** 原子递增/递减点赞数 */
-    @org.apache.ibatis.annotations.Update("UPDATE t_video SET like_count = GREATEST(0, like_count + #{delta}) WHERE id = #{videoId}")
+    /** 原子递增/递减点赞数；NULL 计数按 0 处理。 */
+    @org.apache.ibatis.annotations.Update("UPDATE t_video SET like_count = GREATEST(0, COALESCE(like_count, 0) + #{delta}) WHERE id = #{videoId} AND is_delete = 0")
     int incrementLike(@Param("videoId") Long videoId, @Param("delta") int delta);
 
-    /** 原子递增/递减收藏数 */
-    @org.apache.ibatis.annotations.Update("UPDATE t_video SET collect_count = GREATEST(0, collect_count + #{delta}) WHERE id = #{videoId}")
+    /** 原子递增/递减收藏数；NULL 计数按 0 处理。 */
+    @org.apache.ibatis.annotations.Update("UPDATE t_video SET collect_count = GREATEST(0, COALESCE(collect_count, 0) + #{delta}) WHERE id = #{videoId} AND is_delete = 0")
     int incrementCollect(@Param("videoId") Long videoId, @Param("delta") int delta);
+
+    /** 原子递增分享数；分享不是用户关系，因此每次调用都计数。 */
+    @org.apache.ibatis.annotations.Update("UPDATE t_video SET share_count = GREATEST(0, COALESCE(share_count, 0) + #{delta}) WHERE id = #{videoId} AND is_delete = 0")
+    int incrementShare(@Param("videoId") Long videoId, @Param("delta") int delta);
+
+    /** 读取分享计数，不加载整行视频。 */
+    @org.apache.ibatis.annotations.Select("SELECT share_count FROM t_video WHERE id = #{videoId} AND is_delete = 0")
+    Long selectShareCount(@Param("videoId") Long videoId);
 }

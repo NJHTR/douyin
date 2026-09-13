@@ -78,8 +78,10 @@
 
 <script setup lang="ts">
 import { _checkImgUrl, _duration, _stopPropagation } from '@/utils'
-import { recordWatch, toggleVideoLike } from '@/api/videos'
+import { toggleVideoLike } from '@/api/videos'
 import { getBrowsingSessionId } from '@/utils/session'
+import { queueRecommendationWatch } from '@/utils/recommendationTelemetryClient'
+import { trafficSourceForFeed } from '@/utils/recommendation'
 import { getResumePosition, persistPosition } from '@/utils/watchPosition'
 import Loading from '../Loading.vue'
 import ItemToolbar from './ItemToolbar.vue'
@@ -181,6 +183,8 @@ const sessionPositions = new Map<string, number>()
 let watchSec = 0
 let watchTimer: any = null
 let watchReported = false
+let lastReportedSec = -1
+let lastProfileSampleSec = -1
 let positionResumed = false // 本次播放是否已从断点恢复
 let waitingSince = 0 // buffer 卡顿开始时间戳
 let stallRecoveryTimer: any = null
@@ -190,8 +194,9 @@ const videoDuration = computed(() => state.duration || 0)
 
 function tickWatch() {
   watchSec++
-  // 每 5 秒: 已登录上报后端, 未登录存 localStorage
-  if (watchSec > 0 && watchSec % 5 === 0 && !watchReported) {
+  // A 15s heartbeat is enough for resume/recommendation signals; pause and
+  // unmount still flush the latest position.
+  if (watchSec > 0 && watchSec % 15 === 0 && !watchReported) {
     if (store.userinfo?.uid) {
       sendWatchProgress()
     } else if (videoId.value) {
@@ -201,9 +206,12 @@ function tickWatch() {
   }
 }
 
-function sendWatchProgress(finished = false) {
+function sendWatchProgress(finished = false, profileSample = false) {
   if (!store.userinfo?.uid || !videoId.value) return
   if (String(store.userinfo.uid) === authorUserId.value) return // 不看自己的
+  if (watchSec <= 0) return
+  if (profileSample && watchSec === lastProfileSampleSec) return
+  if (!finished && !profileSample && watchSec === lastReportedSec) return
   const dur = watchSec
   const currentPos = videoEl?.currentTime || 0
   sessionPositions.set(videoId.value, currentPos)
@@ -211,15 +219,18 @@ function sendWatchProgress(finished = false) {
   if (currentPos > 1) {
     persistPosition(videoId.value, currentPos, !!store.userinfo?.uid)
   }
-  recordWatch(videoId.value, {
+  queueRecommendationWatch(videoId.value, {
     watch_duration: dur,
     video_duration: videoDuration.value,
     finished,
     session_id: getBrowsingSessionId(),
     swipe_seconds: dur,
-    traffic_source: 'HOME_RECOMMEND',
-    last_position: Math.floor(currentPos)
-  }).catch(() => {})
+    traffic_source: trafficSourceForFeed(props.position?.uniqueId),
+    last_position: Math.floor(currentPos),
+    profile_sample: profileSample || finished
+  })
+  lastReportedSec = watchSec
+  if (profileSample || finished) lastProfileSampleSec = watchSec
   if (finished) watchReported = true
 }
 
@@ -382,14 +393,14 @@ onMounted(() => {
       clearInterval(watchTimer)
       watchTimer = null
     }
-    sendWatchProgress()
+    sendWatchProgress(false, true)
   })
   videoEl.addEventListener('ended', () => {
     if (watchTimer) {
       clearInterval(watchTimer)
       watchTimer = null
     }
-    sendWatchProgress(true)
+    sendWatchProgress(true, true)
   })
 
   // console.log('mounted')
@@ -417,7 +428,7 @@ onUnmounted(() => {
     clearInterval(stallRecoveryTimer)
     stallRecoveryTimer = null
   }
-  sendWatchProgress()
+  sendWatchProgress(false, true)
   watchSec = 0
   bus.off(EVENT_KEY.SINGLE_CLICK_BROADCAST, click)
   bus.off(EVENT_KEY.DIALOG_MOVE, onDialogMove)
@@ -539,7 +550,13 @@ function click({ uniqueId, index, type }) {
 function play() {
   state.status = SlideItemPlayStatus.Play
   videoEl.volume = 1
-  videoEl.play()
+  videoEl.play().catch(() => {
+    // Edge/Chrome may reject an unmuted autoplay after a slide transition;
+    // keep the video visible and let the user explicitly enable audio.
+    videoEl.muted = true
+    state.isMuted = true
+    return videoEl.play().catch(() => {})
+  })
 }
 
 function pause() {

@@ -1,5 +1,7 @@
 package com.douyin.rtc.stage;
 
+import org.springframework.stereotype.Component;
+
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -9,6 +11,7 @@ import java.util.Map;
  * 内存 Stage 存储。单实例部署语义正确(CAS + 审计);多实例需替换为 Redis/DB 端口,
  * 当前不作为生产扩容证据。
  */
+@Component
 public class InMemoryStageStore implements StageStore {
 
     private final Map<String, StageMember> members = new ConcurrentHashMap<>();

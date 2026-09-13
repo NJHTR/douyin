@@ -21,18 +21,25 @@ public class WebSocketConfig implements WebSocketConfigurer {
     private final DashboardWebSocketHandler dashboardHandler;
     private final WebSocketHandshakeInterceptor handshakeInterceptor;
     private final String[] allowedOrigins;
+    private final String activeProfile;
 
     public WebSocketConfig(ChatWebSocketHandler chatHandler,
                            LiveStreamHandler liveStreamHandler,
                            DashboardWebSocketHandler dashboardHandler,
                            WebSocketHandshakeInterceptor handshakeInterceptor,
-                           @Value("${websocket.allowed-origins:http://localhost:3000,http://127.0.0.1:3000,https://localhost:3000,https://127.0.0.1:3000,https://10.68.138.84:3000}") String allowedOrigins) {
+                           @Value("${websocket.allowed-origins:http://localhost:3000,http://127.0.0.1:3000,https://localhost:3000,https://127.0.0.1:3000}") String allowedOrigins,
+                           @Value("${spring.profiles.active:dev}") String activeProfile) {
         this.chatHandler = chatHandler;
         this.liveStreamHandler = liveStreamHandler;
         this.dashboardHandler = dashboardHandler;
         this.handshakeInterceptor = handshakeInterceptor;
         this.allowedOrigins = Arrays.stream(allowedOrigins.split(","))
                 .map(String::trim).filter(value -> !value.isEmpty()).toArray(String[]::new);
+        this.activeProfile = activeProfile;
+        if (isProduction() && (this.allowedOrigins.length == 0
+                || Arrays.stream(this.allowedOrigins).anyMatch(value -> "*".equals(value)))) {
+            throw new IllegalStateException("Production WebSocket origins must be explicitly configured");
+        }
     }
 
     @Override
@@ -46,5 +53,11 @@ public class WebSocketConfig implements WebSocketConfigurer {
         registry.addHandler(dashboardHandler, "/ws/dashboard/stream")
                 .addInterceptors(handshakeInterceptor)
                 .setAllowedOriginPatterns(this.allowedOrigins);
+    }
+
+    private boolean isProduction() {
+        return Arrays.stream(activeProfile.split(","))
+                .map(String::trim)
+                .anyMatch("prod"::equalsIgnoreCase);
     }
 }

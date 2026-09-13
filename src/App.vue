@@ -1,5 +1,6 @@
 <template>
-  <router-view v-slot="{ Component }">
+  <NivoDesktopShell v-if="showDesktopShell" />
+  <router-view v-else v-slot="{ Component }">
     <transition :name="transitionName">
       <keep-alive :exclude="store.excludeNames">
         <component :is="Component" />
@@ -14,25 +15,35 @@
 * try {navigator.control.gesture(false);} catch (e) {} //UC浏览器关闭默认手势事件
 try {navigator.control.longpressMenu(false);} catch (e) {} //关闭长按弹出菜单
 * */
-import routes from './router/routes'
 import Call from './components/Call.vue'
 import CallPanel from '@/modules/rtc/components/CallPanel.vue'
+import NivoDesktopShell from './components/NivoDesktopShell.vue'
 import { useBaseStore } from '@/store/pinia.js'
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import type { RouteRecordRaw } from 'vue-router'
-import { connectSocket } from '@/utils/socket'
 import bus from '@/utils/bus'
 import {
   installNotificationFeedbackUnlock,
+  installSoundLifecycle,
   notificationKindFromType,
-  playNotificationFeedback
+  playSound
 } from '@/utils/notificationFeedback'
 
 const store = useBaseStore()
 const route = useRoute()
 const transitionName = ref('go')
+const isDesktop = ref(false)
+const showDesktopShell = computed(() => isDesktop.value && !route.path.startsWith('/login') && !route.path.startsWith('/admin'))
+let mediaQuery: MediaQueryList | undefined
+const updateViewportMode = () => { isDesktop.value = window.matchMedia('(min-width: 1000px)').matches }
 let removeFeedbackUnlock = () => {}
+let removeSoundLifecycle = () => {}
+
+function navigationDepth(path: string): number {
+  const normalized = path.split('?')[0].replace(/^\/+|\/+$/g, '')
+  if (!normalized) return 0
+  return normalized.split('/').length
+}
 
 function isFromCurrentUser(message: any): boolean {
   const currentUid = String(store.userinfo?.uid ?? '')
@@ -42,9 +53,12 @@ function isFromCurrentUser(message: any): boolean {
     .some((value) => String(value) === currentUid)
 }
 
-function playIncomingFeedback(kind: Parameters<typeof playNotificationFeedback>[0], message: any) {
+function playIncomingFeedback(kind: 'chat' | 'group', message: any) {
   if (isFromCurrentUser(message)) return
-  void playNotificationFeedback(kind)
+  void playSound('message.received', {
+    eventId: String(message?.id ?? message?.message_id ?? `${kind}:${message?.create_time ?? Date.now()}`),
+    isCurrentConversation: route.path.includes('/chat/')
+  })
 }
 
 function onChatMessage(message: any) {
@@ -56,7 +70,13 @@ function onGroupMessage(message: any) {
 }
 
 function onNotification(message: any) {
-  playIncomingFeedback(notificationKindFromType(message?.type), message)
+  if (isFromCurrentUser(message)) return
+  const kind = notificationKindFromType(message?.type)
+  const event = kind === 'mention' || kind === 'friend' ? 'notification.important' : 'notification.normal'
+  void playSound(event, {
+    eventId: String(message?.id ?? message?.notification_id ?? `${event}:${message?.create_time ?? Date.now()}`),
+    isCurrentConversation: route.path.includes('/chat/')
+  })
 }
 
 function onCallSignal(message: any) {
@@ -86,8 +106,8 @@ watch(
     if (noAnimation.indexOf(from) !== -1 && noAnimation.indexOf(to) !== -1) {
       return (transitionName.value = '')
     }
-    const toDepth = routes.findIndex((v: RouteRecordRaw) => v.path === to)
-    const fromDepth = routes.findIndex((v: RouteRecordRaw) => v.path === from)
+    const toDepth = navigationDepth(to)
+    const fromDepth = navigationDepth(from)
     transitionName.value = toDepth > fromDepth ? 'go' : 'back'
   }
 )
@@ -98,10 +118,19 @@ function resetVhAndPx() {
   //document.documentElement.style.fontSize = document.documentElement.clientWidth / 375 + 'px'
 }
 
+const retryRestore = () => {
+  if (localStorage.getItem('token') && !store.profileLoaded) void store.restoreSession()
+}
+
 onMounted(() => {
-  store.init()
-  connectSocket().catch(() => {})
+  mediaQuery = window.matchMedia('(min-width: 1000px)')
+  updateViewportMode()
+  mediaQuery.addEventListener?.('change', updateViewportMode)
+  void store.init()
+  window.addEventListener('online', retryRestore)
+  window.addEventListener('focus', retryRestore)
   removeFeedbackUnlock = installNotificationFeedbackUnlock()
+  removeSoundLifecycle = installSoundLifecycle()
   bus.on('CHAT_MESSAGE', onChatMessage)
   bus.on('GROUP_MESSAGE', onGroupMessage)
   bus.on('NEW_NOTIFICATION', onNotification)
@@ -114,11 +143,15 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  mediaQuery?.removeEventListener?.('change', updateViewportMode)
   removeFeedbackUnlock()
+  removeSoundLifecycle()
   bus.off('CHAT_MESSAGE', onChatMessage)
   bus.off('GROUP_MESSAGE', onGroupMessage)
   bus.off('NEW_NOTIFICATION', onNotification)
   bus.off('CALL_SIGNAL', onCallSignal)
+  window.removeEventListener('online', retryRestore)
+  window.removeEventListener('focus', retryRestore)
 })
 </script>
 
@@ -141,12 +174,10 @@ textarea {
   font-size: 14rem;
 }
 
-@media screen and (min-width: 500px) {
+@media screen and (min-width: 1000px) {
   #app {
-    width: 500px !important;
+    width: 100% !important;
     position: relative;
-    left: 50%;
-    transform: translateX(-50%);
   }
 }
 

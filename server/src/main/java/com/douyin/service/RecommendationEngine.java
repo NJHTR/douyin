@@ -11,7 +11,6 @@ import org.springframework.stereotype.Service;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 /**
@@ -35,6 +34,8 @@ public class RecommendationEngine {
 
     private static final int RECALL_PER_CHANNEL = RecommendationConfig.RECALL_PER_CHANNEL;
     private static final int CANDIDATE_POOL_SIZE = RecommendationConfig.CANDIDATE_POOL_SIZE;
+    private static final int MAX_BEHAVIOR_HISTORY = 2000;
+    private static final int MAX_EXPOSURE_EXCLUDES = 2000;
 
     private volatile List<String> cachedTrendingKeywords = List.of();
     private volatile long trendingKeywordsCacheTime = 0;
@@ -70,14 +71,61 @@ public class RecommendationEngine {
         this.objectMapper = new ObjectMapper();
     }
 
-    /** 主入口: 为用户推荐视频 */
+    /** Legacy HOME entry point. */
     public List<Long> recommend(Long userId, int pageSize, Double minDuration) {
+        return recommend(userId, pageSize, minDuration, FeedChannel.HOME);
+    }
+
+    /**
+     * Main recommendation entry point.  HOT is deliberately handled outside
+     * the personalized engine so a logged-in user cannot accidentally turn
+     * the global trending feed into HOME.
+     */
+    public List<Long> recommend(Long userId, int pageSize, Double minDuration, FeedChannel channel) {
+        return recommendInternal(userId, pageSize, minDuration, channel, true);
+    }
+
+    /** Build a bounded candidate pool without marking every candidate exposed. */
+    public List<Long> recommendPool(Long userId, int poolSize, Double minDuration, FeedChannel channel) {
+        return recommendInternal(userId, poolSize, minDuration, channel, false);
+    }
+
+    private List<Long> recommendInternal(Long userId, int pageSize, Double minDuration,
+                                         FeedChannel channel, boolean recordExposure) {
+        pageSize = Math.min(CANDIDATE_POOL_SIZE, Math.max(1, pageSize));
+        FeedChannel effectiveChannel = channel == null ? FeedChannel.HOME : channel;
+        if (effectiveChannel == FeedChannel.HOT) {
+            return hotOnly(userId, pageSize, minDuration, recordExposure);
+        }
+
+        if (effectiveChannel == FeedChannel.FOLLOWING) {
+            return followingOnly(userId, pageSize, minDuration, recordExposure);
+        }
+
+        if (effectiveChannel == FeedChannel.FRIENDS) {
+            return friendsOnly(userId, pageSize, minDuration, recordExposure);
+        }
+
+        // Live rooms have a separate media index/API. Do not silently serve
+        // VOD when that index is unavailable.
+        if (effectiveChannel == FeedChannel.LIVE) {
+            return List.of();
+        }
+
+        // EXPERIENCE intentionally increases the deterministic exploration
+        // share; LONG_VIDEO is still personalized but constrained by duration.
+        return recommendPersonalized(userId, pageSize, minDuration, effectiveChannel, recordExposure);
+    }
+
+    private List<Long> recommendPersonalized(Long userId, int pageSize, Double minDuration,
+                                             FeedChannel channel, boolean recordExposure) {
         // 0. 获取已互动视频 ID + 互动作者集合
         int recentCount = 0, likedCount = 0, collectedCount = 0, watchedCount = 0;
 
         // 硬过滤：24h 内曝光过的
-        Set<Long> excludeIds = getRecentExposures(userId);
-        recentCount = excludeIds.size();
+        Set<Long> recentExposureIds = getRecentExposures(userId);
+        Set<Long> excludeIds = new HashSet<>(recentExposureIds);
+        recentCount = recentExposureIds.size();
 
         // 软惩罚：已点赞/收藏的视频不硬排除，但给时间衰减惩罚
         Map<Long, LocalDateTime> likedMap = getLikedVideoMap(userId);
@@ -99,19 +147,42 @@ public class RecommendationEngine {
         Set<Long> interactedAuthorIds = getInteractedAuthorIds(userId, likedMap, collectedMap);
 
         UserContentProfile profile = profileMapper.selectById(userId);
+        boolean coldStart = isColdStart(profile, userId);
 
         // 1. 多路召回 (6 路)
         List<Long> cfCandidates = collaborativeRecall(userId, excludeIds, RECALL_PER_CHANNEL, minDuration);
         List<Long> socialCandidates = socialRecall(userId, excludeIds, RECALL_PER_CHANNEL, minDuration);
         List<Long> contentCandidates = contentRecall(profile, excludeIds, RECALL_PER_CHANNEL, minDuration);
         List<Long> hotCandidates = hotRecall(excludeIds, RECALL_PER_CHANNEL, minDuration);
-        List<Long> exploreCandidates = exploreRecall(profile, excludeIds, RECALL_PER_CHANNEL, minDuration);
+        int exploreLimit = channel == FeedChannel.EXPERIENCE
+                ? RECALL_PER_CHANNEL * 2 : RECALL_PER_CHANNEL;
+        List<Long> exploreCandidates = exploreRecall(profile, excludeIds, exploreLimit, minDuration);
         List<Long> backlogCandidates = creatorBacklogRecall(userId, excludeIds, interactedAuthorIds,
                 RECALL_PER_CHANNEL, minDuration);
+        // A cold account has no evidence for account-specific ordering yet.
+        // Use the bounded quality/freshness order from the recall query; do
+        // not manufacture personalization from the account ID.
+        List<Long> coldStartCandidates = coldStartRecall(excludeIds,
+                RECALL_PER_CHANNEL, minDuration);
+
+        // A candidate recalled by a relevance/social/hot route remains in the
+        // main rank. Only exploration-exclusive candidates consume explicit
+        // exploration slots; multi-route evidence must never demote content.
+        Set<Long> mainRecallIds = new HashSet<>();
+        mainRecallIds.addAll(backlogCandidates);
+        if (coldStart) mainRecallIds.addAll(coldStartCandidates);
+        mainRecallIds.addAll(contentCandidates);
+        mainRecallIds.addAll(cfCandidates);
+        mainRecallIds.addAll(socialCandidates);
+        mainRecallIds.addAll(hotCandidates);
+        List<Long> explorationOnlyCandidates = exploreCandidates.stream()
+                .filter(id -> !mainRecallIds.contains(id))
+                .toList();
 
         // 2. 合并去重 — 创作者存量召回优先排在前面
         Set<Long> candidateSet = new LinkedHashSet<>();
         candidateSet.addAll(backlogCandidates);
+        if (coldStart) candidateSet.addAll(coldStartCandidates);
         candidateSet.addAll(contentCandidates);
         candidateSet.addAll(cfCandidates);
         candidateSet.addAll(socialCandidates);
@@ -123,6 +194,20 @@ public class RecommendationEngine {
             List<Video> fallback = videoMapper.findRecallCandidates(
                     new ArrayList<>(excludeIds), minDuration, RECALL_PER_CHANNEL);
             fallback.forEach(v -> candidateSet.add(v.getId()));
+        }
+
+        // A small catalogue can be entirely covered by the 24-hour exposure
+        // window. Falling through to the service's global HOT fallback would
+        // discard the user's measured profile and make every account see the
+        // same order. Once no unseen candidate remains, recycle exposed items
+        // but keep recently completed videos excluded and run the normal
+        // evidence-based ranker over the recycled pool.
+        if (candidateSet.size() < pageSize && !recentExposureIds.isEmpty()) {
+            List<Video> recycled = videoMapper.findRecallCandidates(
+                    new ArrayList<>(recentWatchedIds), minDuration, CANDIDATE_POOL_SIZE);
+            recycled.forEach(v -> candidateSet.add(v.getId()));
+            log.debug("推荐未曝光候选不足，回收已曝光内容继续个性化排序: userId={} recycled={}",
+                    userId, candidateSet.size());
         }
 
         List<Long> candidates = new ArrayList<>(candidateSet);
@@ -151,6 +236,14 @@ public class RecommendationEngine {
                 authorFollowerMap, profile, likedMap, collectedMap, interactedAuthorIds,
                 recentEngMap, avgCompletionMap, olderWatchedIds);
 
+        // Only measured relevance signals may change the order between users.
+        // Equal scores use a global stable tie-break, so two accounts with the
+        // same evidence are allowed to receive the same feed.
+        scored.sort(Comparator
+                .comparingDouble(ScoredVideo::score).reversed()
+                .thenComparing(ScoredVideo::videoId,
+                        Comparator.nullsLast(Comparator.reverseOrder())));
+
         // 构建视频年龄映射 (小时)
         Map<Long, Long> videoAgeHours = videos.stream()
                 .filter(v -> v.getCreateTime() != null)
@@ -163,10 +256,11 @@ public class RecommendationEngine {
                 .collect(Collectors.toMap(Video::getId, Video::getType, (a, b) -> a));
 
         // 5. 多样性重排
-        List<Long> result = reRank(scored, contentMap, exploreCandidates, pageSize, videoAgeHours, videoTypeMap);
+        List<Long> result = reRank(scored, contentMap, explorationOnlyCandidates,
+                pageSize, videoAgeHours, videoTypeMap);
 
         // 6. 记录曝光
-        recordExposuresBatch(userId, result);
+        if (recordExposure) recordExposuresBatch(userId, result);
 
         log.info("推荐完成: userId={} candidates={} exclude[recent={} liked={} collected={} watched={}] interactedAuthors={} result={}",
                 userId, candidates.size(),
@@ -176,13 +270,92 @@ public class RecommendationEngine {
         return result;
     }
 
+    /** Global HOT channel: no profile, follows, likes, or account-specific ordering. */
+    private List<Long> hotOnly(Long userId, int pageSize, Double minDuration, boolean recordExposure) {
+        Set<Long> excludes = userId == null ? Set.of() : getRecentExposures(userId);
+        List<Long> result = hotRecall(excludes, Math.max(1, pageSize), minDuration);
+        if (recordExposure && userId != null) recordExposuresBatch(userId, result);
+        return result;
+    }
+
+    /** FOLLOWING channel: only authors explicitly followed by the viewer. */
+    private List<Long> followingOnly(Long userId, int pageSize, Double minDuration, boolean recordExposure) {
+        if (userId == null) return List.of();
+        List<Long> followed = followMapper.selectList(new LambdaQueryWrapper<Follow>()
+                .eq(Follow::getUserId, userId)
+                        .orderByDesc(Follow::getCreateTime)
+                        .orderByDesc(Follow::getId)
+                        .last("LIMIT " + RecommendationConfig.SOCIAL_FOLLOW_LIMIT))
+                .stream()
+                .map(Follow::getFollowId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+        if (followed.isEmpty()) return List.of();
+
+        Set<Long> excludes = getRecentExposures(userId);
+        LambdaQueryWrapper<Video> wrapper = new LambdaQueryWrapper<Video>()
+                .in(Video::getAuthorUserId, followed)
+                .notIn(Video::getId, excludes.isEmpty() ? Set.of(-1L) : excludes)
+                .in(Video::getType, List.of("recommend-video", "image", "text"))
+                .eq(Video::getStatus, "APPROVED")
+                .orderByDesc(Video::getCreateTime)
+                .orderByDesc(Video::getId)
+                .last("LIMIT " + Math.max(1, pageSize));
+        if (minDuration != null) wrapper.ge(Video::getDuration, minDuration);
+        List<Long> result = videoMapper.selectList(wrapper).stream().map(Video::getId).toList();
+        if (recordExposure) recordExposuresBatch(userId, result);
+        return result;
+    }
+
+    /** FRIENDS channel: videos authored by mutual-follow accounts. */
+    private List<Long> friendsOnly(Long userId, int pageSize, Double minDuration, boolean recordExposure) {
+        if (userId == null) return List.of();
+        List<Long> friendIds = followMapper.findMutualFollowIds(userId,
+                RecommendationConfig.SOCIAL_FOLLOW_LIMIT);
+        if (friendIds == null || friendIds.isEmpty()) return List.of();
+
+        Set<Long> excludes = getRecentExposures(userId);
+        LambdaQueryWrapper<Video> wrapper = new LambdaQueryWrapper<Video>()
+                .in(Video::getAuthorUserId, friendIds)
+                .notIn(Video::getId, excludes.isEmpty() ? Set.of(-1L) : excludes)
+                .in(Video::getType, List.of("recommend-video", "image", "text"))
+                .eq(Video::getStatus, "APPROVED")
+                .orderByDesc(Video::getCreateTime)
+                .orderByDesc(Video::getId)
+                .last("LIMIT " + Math.max(1, pageSize));
+        if (minDuration != null) wrapper.ge(Video::getDuration, minDuration);
+        List<Long> result = videoMapper.selectList(wrapper).stream().map(Video::getId).toList();
+        if (recordExposure) recordExposuresBatch(userId, result);
+        return result;
+    }
+
+    private boolean isColdStart(UserContentProfile profile, Long userId) {
+        if (profile == null) return true;
+        int views = profile.getTotalViewCount() != null ? profile.getTotalViewCount() : 0;
+        int watches = profile.getTotalWatchCount() != null ? profile.getTotalWatchCount() : 0;
+        return views < RecommendationConfig.SEG_NEW_USER
+                && watches < RecommendationConfig.SEG_NEW_USER;
+    }
+
+    /** Pull a bounded quality/freshness pool for accounts with no behavior yet. */
+    private List<Long> coldStartRecall(Set<Long> excludeIds, int limit,
+                                       Double minDuration) {
+        int broadLimit = Math.min(800, Math.max(limit * 8, 160));
+        List<Video> pool = videoMapper.findRecallCandidates(
+                new ArrayList<>(excludeIds), minDuration, broadLimit);
+        if (pool.isEmpty()) return List.of();
+        return pool.stream()
+                .limit(Math.max(1, limit))
+                .map(Video::getId)
+                .toList();
+    }
+
     // ===================== 已互动内容映射 =====================
 
     /** 用户已点赞的视频 → 点赞时间 (用于时间衰减惩罚) */
     private Map<Long, LocalDateTime> getLikedVideoMap(Long userId) {
-        return likeMapper.selectList(new LambdaQueryWrapper<Like>()
-                .eq(Like::getUserId, userId)
-                .select(Like::getVideoId, Like::getCreateTime))
+        return likeMapper.findRecentLikes(userId, MAX_BEHAVIOR_HISTORY)
                 .stream()
                 .filter(l -> l.getCreateTime() != null)
                 .collect(Collectors.toMap(Like::getVideoId, Like::getCreateTime, (a, b) -> a));
@@ -190,9 +363,7 @@ public class RecommendationEngine {
 
     /** 用户已收藏的视频 → 收藏时间 (用于时间衰减惩罚) */
     private Map<Long, LocalDateTime> getCollectedVideoMap(Long userId) {
-        return collectMapper.selectList(new LambdaQueryWrapper<VideoCollect>()
-                .eq(VideoCollect::getUserId, userId)
-                .select(VideoCollect::getVideoId, VideoCollect::getCreateTime))
+        return collectMapper.findRecentCollects(userId, MAX_BEHAVIOR_HISTORY)
                 .stream()
                 .filter(c -> c.getCreateTime() != null)
                 .collect(Collectors.toMap(VideoCollect::getVideoId, VideoCollect::getCreateTime, (a, b) -> a));
@@ -201,12 +372,8 @@ public class RecommendationEngine {
     /** 最近 N 天内完整观看过的视频 ID 集合 */
     private Set<Long> getFullyWatchedVideoIds(Long userId, int days) {
         LocalDateTime since = LocalDateTime.now().minusDays(days);
-        return watchHistoryMapper.selectList(new LambdaQueryWrapper<WatchHistory>()
-                .eq(WatchHistory::getUserId, userId)
-                .ge(WatchHistory::getCreateTime, since)
-                .eq(WatchHistory::getFinished, 1))
-                .stream().map(WatchHistory::getVideoId)
-                .collect(Collectors.toSet());
+        return new HashSet<>(watchHistoryMapper.findRecentFinishedVideoIds(
+                userId, since, MAX_BEHAVIOR_HISTORY));
     }
 
     /** 用户互动过的作者 ID 集合 (通过点赞/收藏的视频反查作者) */
@@ -234,7 +401,8 @@ public class RecommendationEngine {
         return watchHistoryMapper.selectList(new LambdaQueryWrapper<WatchHistory>()
                 .eq(WatchHistory::getUserId, userId)
                 .in(WatchHistory::getVideoId, videoIds)
-                .orderByDesc(WatchHistory::getCreateTime))
+                .orderByDesc(WatchHistory::getUpdateTime)
+                .orderByDesc(WatchHistory::getId))
                 .stream()
                 .collect(Collectors.toMap(
                         WatchHistory::getVideoId, w -> w,
@@ -318,11 +486,12 @@ public class RecommendationEngine {
                                       int limit, Double minDuration) {
         List<Video> videos = videoMapper.findRecallCandidates(
                 new ArrayList<>(excludeIds), minDuration, limit * RecommendationConfig.RECALL_OVERSAMPLE_CONTENT);
-        if (profile == null || profile.getContentVector() == null || videos.isEmpty()) {
+        String profileVector = profileVector(profile);
+        if (profileVector == null || videos.isEmpty()) {
             return videos.stream().map(Video::getId).limit(limit).toList();
         }
 
-        List<Double> userVec = parseVector(profile.getContentVector());
+        List<Double> userVec = parseVector(profileVector);
         if (userVec == null) return videos.stream().map(Video::getId).limit(limit).toList();
 
         List<Long> videoIds = videos.stream().map(Video::getId).toList();
@@ -334,7 +503,9 @@ public class RecommendationEngine {
                     double catBonus = categoryBonus(profile, contentMap.get(v.getId()));
                     return new CandidateScore(v.getId(), sim + catBonus);
                 })
-                .sorted(Comparator.comparingDouble(CandidateScore::score).reversed())
+                .sorted(Comparator.comparingDouble(CandidateScore::score).reversed()
+                        .thenComparing(CandidateScore::videoId,
+                                Comparator.nullsLast(Comparator.reverseOrder())))
                 .limit(limit)
                 .map(CandidateScore::videoId)
                 .toList();
@@ -358,8 +529,18 @@ public class RecommendationEngine {
                 .eq(Video::getStatus, "APPROVED")
                 .in(Video::getType, List.of("recommend-video", "image", "text"));
         if (minDuration != null) wrapper.ge(Video::getDuration, minDuration);
-        wrapper.last("LIMIT " + limit);
-        return videoMapper.selectList(wrapper).stream().map(Video::getId).toList();
+        Set<Long> validIds = videoMapper.selectList(wrapper).stream()
+                .map(Video::getId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+        // Keep the co-like score order returned by findCoLikedVideoIds.  An
+        // unordered IN query with LIMIT would otherwise select an arbitrary
+        // subset before the ranker has a chance to score it.
+        return candidateIds.stream()
+                .filter(validIds::contains)
+                .distinct()
+                .limit(limit)
+                .toList();
     }
 
     /** 社交召回: 关注作者 + 最近互动作者的新视频 */
@@ -367,7 +548,10 @@ public class RecommendationEngine {
         Set<Long> authorIds = new LinkedHashSet<>();
 
         List<Follow> follows = followMapper.selectList(new LambdaQueryWrapper<Follow>()
-                .eq(Follow::getUserId, userId).last("LIMIT " + RecommendationConfig.SOCIAL_FOLLOW_LIMIT));
+                .eq(Follow::getUserId, userId)
+                .orderByDesc(Follow::getCreateTime)
+                .orderByDesc(Follow::getId)
+                .last("LIMIT " + RecommendationConfig.SOCIAL_FOLLOW_LIMIT));
         follows.forEach(f -> authorIds.add(f.getFollowId()));
 
         List<Long> recentAuthors = videoMapper.findRecentAuthorIds(userId, RecommendationConfig.SOCIAL_RECENT_AUTHOR_LIMIT);
@@ -381,6 +565,7 @@ public class RecommendationEngine {
                 .in(Video::getType, List.of("recommend-video", "image", "text"))
                 .eq(Video::getStatus, "APPROVED")
                 .orderByDesc(Video::getCreateTime)
+                .orderByDesc(Video::getId)
                 .last("LIMIT " + limit);
         if (minDuration != null) wrapper.ge(Video::getDuration, minDuration);
         return videoMapper.selectList(wrapper).stream().map(Video::getId).toList();
@@ -393,21 +578,22 @@ public class RecommendationEngine {
                 .eq(Video::getStatus, "APPROVED")
                 .notIn(Video::getId, excludeIds.isEmpty() ? Set.of(-1L) : excludeIds)
                 .orderByDesc(Video::getLikeCount)
-                .orderByDesc(Video::getCreateTime);
+                .orderByDesc(Video::getCreateTime)
+                .orderByDesc(Video::getId);
         if (minDuration != null) wrapper.ge(Video::getDuration, minDuration);
         wrapper.last("LIMIT " + limit);
         return videoMapper.selectList(wrapper).stream().map(Video::getId).toList();
     }
 
-    /** 探索召回: 用户未充分接触的品类 + 随机高质量 */
+    /** 探索召回: 用户未充分接触的品类 + 质量/新鲜度候选。 */
     private List<Long> exploreRecall(UserContentProfile profile, Set<Long> excludeIds,
                                       int limit, Double minDuration) {
         List<Video> videos = videoMapper.findRecallCandidates(
                 new ArrayList<>(excludeIds), minDuration, limit * RecommendationConfig.RECALL_OVERSAMPLE_EXPLORE);
 
         if (profile == null || profile.getCategoryWeights() == null) {
-            Collections.shuffle(videos, ThreadLocalRandom.current());
-            return videos.stream().map(Video::getId).limit(limit).toList();
+            return videos.stream()
+                    .map(Video::getId).limit(limit).toList();
         }
 
         Map<String, Double> catWeights = parseCategoryWeights(profile.getCategoryWeights());
@@ -421,10 +607,14 @@ public class RecommendationEngine {
                     double exploreScore = cat != null
                             ? (1.0 - catWeights.getOrDefault(cat, 0.0))
                             : RecommendationConfig.DEF_SCORE_HALF;
-                    return new CandidateScore(v.getId(),
-                            exploreScore + ThreadLocalRandom.current().nextDouble() / RecommendationConfig.EXPLORE_RANDOM_FACTOR);
+                    // findRecallCandidates already orders equal-score items by
+                    // extraction quality and freshness. Stream sorting is
+                    // stable, so this preserves that evidence-based order.
+                    return new CandidateScore(v.getId(), exploreScore);
                 })
-                .sorted(Comparator.comparingDouble(CandidateScore::score).reversed())
+                .sorted(Comparator.comparingDouble(CandidateScore::score).reversed()
+                        .thenComparing(CandidateScore::videoId,
+                                Comparator.nullsLast(Comparator.reverseOrder())))
                 .limit(limit)
                 .map(CandidateScore::videoId)
                 .toList();
@@ -440,7 +630,10 @@ public class RecommendationEngine {
         Set<Long> authorIds = new LinkedHashSet<>();
         // 关注作者
         List<Follow> follows = followMapper.selectList(new LambdaQueryWrapper<Follow>()
-                .eq(Follow::getUserId, userId).last("LIMIT " + RecommendationConfig.BACKLOG_FOLLOW_LIMIT));
+                .eq(Follow::getUserId, userId)
+                .orderByDesc(Follow::getCreateTime)
+                .orderByDesc(Follow::getId)
+                .last("LIMIT " + RecommendationConfig.BACKLOG_FOLLOW_LIMIT));
         follows.forEach(f -> authorIds.add(f.getFollowId()));
         // 互动作者
         authorIds.addAll(interactedAuthorIds);
@@ -456,6 +649,7 @@ public class RecommendationEngine {
                 .ge(Video::getCreateTime, LocalDateTime.now().minusDays(RecommendationConfig.DAYS_BACKLOG_MAX))
                 .orderByDesc(Video::getLikeCount)
                 .orderByDesc(Video::getCreateTime)
+                .orderByDesc(Video::getId)
                 .last("LIMIT " + limit);
         if (minDuration != null) wrapper.ge(Video::getDuration, minDuration);
         return videoMapper.selectList(wrapper).stream().map(Video::getId).toList();
@@ -475,9 +669,18 @@ public class RecommendationEngine {
                                            Map<Long, Double> avgCompletionMap,
                                            Set<Long> olderWatchedIds) {
         if (profile == null) profile = profileService.getOrCreate(userId);
+        // A missing profile is a valid cold-start state.  Keep ranking on the
+        // global quality/freshness signals until the first behavior event,
+        // instead of failing the feed request or inventing account-specific
+        // ordering.
+        if (profile == null) {
+            profile = new UserContentProfile();
+            profile.setUserId(userId);
+            profile.setUserType("balanced");
+        }
 
-        List<Double> userVec = parseVector(profile.getContentVector());
-        List<Double> userVecShort = parseVector(profile.getShortTermVector());
+        List<Double> userVec = parseVector(profileVector(profile));
+        List<Double> userVecShort = parseVector(profile != null ? profile.getShortTermVector() : null);
         Map<String, Double> creatorAffinity = parseCreatorAffinityMap(profile.getCreatorAffinity());
         List<String> recentSearches = parseRecentSearches(profile.getRecentSearchQueries());
         Map<String, Double> catWeights = parseCategoryWeights(profile.getCategoryWeights());
@@ -595,10 +798,8 @@ public class RecommendationEngine {
      */
     private CategoryFeedback calcCategoryFeedback(Long userId) {
         LocalDateTime since = LocalDateTime.now().minusDays(RecommendationConfig.DAYS_CATEGORY_FEEDBACK);
-        List<WatchHistory> recentWatches = watchHistoryMapper.selectList(
-                new LambdaQueryWrapper<WatchHistory>()
-                        .eq(WatchHistory::getUserId, userId)
-                        .ge(WatchHistory::getCreateTime, since));
+        List<WatchHistory> recentWatches = watchHistoryMapper.findRecentCategoryFeedback(
+                userId, since, RecommendationConfig.LIMIT_CATEGORY_FEEDBACK_HISTORY);
         if (recentWatches.isEmpty()) return new CategoryFeedback(Map.of(), Map.of());
 
         // 拆分为快划和完整观看两组
@@ -672,6 +873,8 @@ public class RecommendationEngine {
                     new LambdaQueryWrapper<UserContentProfile>()
                             .ge(UserContentProfile::getUpdateTime, since)
                             .isNotNull(UserContentProfile::getRecentSearchQueries)
+                            .orderByDesc(UserContentProfile::getUpdateTime)
+                            .orderByDesc(UserContentProfile::getUserId)
                             .last("LIMIT 200"));
             Map<String, Integer> keywordFreq = new HashMap<>();
             for (UserContentProfile p : recentProfiles) {
@@ -684,7 +887,8 @@ public class RecommendationEngine {
             }
             List<String> result = keywordFreq.entrySet().stream()
                     .filter(e -> e.getValue() >= RecommendationConfig.LIMIT_TRENDING_MIN_FREQ)
-                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed()
+                            .thenComparing(Map.Entry::getKey))
                     .limit(topN)
                     .map(Map.Entry::getKey)
                     .toList();
@@ -1123,53 +1327,29 @@ public class RecommendationEngine {
         Map<String, Integer> catCount = new HashMap<>();
         Map<String, Integer> typeCount = new HashMap<>();
         int recentCount = 0;
-        int mainIdx = 0, exploreIdx = 0;
-        int exploreEvery = Math.max(3, pageSize / Math.max(1, (int) (pageSize * RecommendationConfig.EXPLORE_INJECT_RATE)));
+        int exploreEvery = Math.max(RecommendationConfig.DIVERSITY_EXPLORE_MIN,
+                (int) Math.round(1.0 / Math.max(0.0001, RecommendationConfig.EXPLORE_INJECT_RATE)));
 
         while (result.size() < pageSize) {
-            boolean injectExplore = result.size() > 0 && result.size() % exploreEvery == 0;
+            boolean injectExplore = !explorePool.isEmpty()
+                    && (result.size() + 1) % exploreEvery == 0;
             // 时间多样性: 已有半数以上是48h内视频 → 跳过新的优先选老的
             boolean needOlder = recentCount > result.size() / 2 && result.size() > 2;
 
             ScoredVideo picked = null;
-            if (injectExplore && exploreIdx < explorePool.size()) {
-                picked = explorePool.get(exploreIdx++);
-            } else if (mainIdx < mainPool.size()) {
-                int skipped = 0;
-                while (mainIdx < mainPool.size()) {
-                    ScoredVideo candidate = mainPool.get(mainIdx);
-                    boolean isRecent = videoAgeHours.getOrDefault(candidate.videoId, 0L)
-                            < RecommendationConfig.DIVERSITY_RECENT_HOURS;
-
-                    if (violatesDiversity(candidate, authorCount, catCount, typeCount, videoTypeMap)) {
-                        mainIdx++;
-                        skipped++;
-                        if (skipped > RecommendationConfig.DIVERSITY_MAX_SKIP) break;
-                    } else if (needOlder && isRecent && skipped < RecommendationConfig.DIVERSITY_TIME_SKIP) {
-                        mainIdx++;
-                        skipped++;
-                    } else {
-                        picked = candidate;
-                        mainIdx++;
-                        break;
-                    }
-                }
-                if (skipped > RecommendationConfig.DIVERSITY_MAX_SKIP) {
-                    if (mainIdx < mainPool.size()) {
-                        picked = mainPool.get(mainIdx++);
-                    } else if (exploreIdx < explorePool.size()) {
-                        picked = explorePool.get(exploreIdx++);
-                    } else {
-                        break;
-                    }
-                } else if (mainIdx >= mainPool.size() && result.isEmpty()) {
-                    break;
-                }
-            } else if (exploreIdx < explorePool.size()) {
-                picked = explorePool.get(exploreIdx++);
-            } else {
-                break;
+            if (injectExplore) {
+                picked = removeBestCandidate(explorePool, false, authorCount, catCount,
+                        typeCount, videoAgeHours, videoTypeMap);
             }
+            if (picked == null && !mainPool.isEmpty()) {
+                picked = removeBestCandidate(mainPool, needOlder, authorCount, catCount,
+                        typeCount, videoAgeHours, videoTypeMap);
+            }
+            if (picked == null && !explorePool.isEmpty()) {
+                picked = removeBestCandidate(explorePool, needOlder, authorCount, catCount,
+                        typeCount, videoAgeHours, videoTypeMap);
+            }
+            if (picked == null) break;
 
             if (picked != null && !result.contains(picked.videoId)) {
                 result.add(picked.videoId);
@@ -1188,6 +1368,40 @@ public class RecommendationEngine {
         return result;
     }
 
+    /**
+     * Pick within a bounded look-ahead window and remove only the chosen item.
+     * Diversity is a soft re-ranking constraint: skipped high-score candidates
+     * remain available for later slots instead of disappearing from the pool.
+     */
+    private ScoredVideo removeBestCandidate(List<ScoredVideo> pool, boolean preferOlder,
+                                             Map<Long, Integer> authorCount,
+                                             Map<String, Integer> catCount,
+                                             Map<String, Integer> typeCount,
+                                             Map<Long, Long> videoAgeHours,
+                                             Map<Long, String> videoTypeMap) {
+        if (pool.isEmpty()) return null;
+        int scanLimit = Math.min(pool.size(), RecommendationConfig.DIVERSITY_MAX_SKIP + 1);
+        int firstEligible = -1;
+        for (int i = 0; i < scanLimit; i++) {
+            ScoredVideo candidate = pool.get(i);
+            if (violatesDiversity(candidate, authorCount, catCount, typeCount, videoTypeMap)) {
+                continue;
+            }
+            if (firstEligible < 0) firstEligible = i;
+            boolean recent = videoAgeHours.getOrDefault(candidate.videoId, 0L)
+                    < RecommendationConfig.DIVERSITY_RECENT_HOURS;
+            if (!preferOlder || !recent) {
+                return pool.remove(i);
+            }
+            if (i >= RecommendationConfig.DIVERSITY_TIME_SKIP) break;
+        }
+
+        // If every nearby candidate hits a cap, relax the cap for the best
+        // remaining score. This preserves page fill and keeps the choice
+        // deterministic without inventing a user-specific shuffle.
+        return pool.remove(firstEligible >= 0 ? firstEligible : 0);
+    }
+
     private boolean violatesDiversity(ScoredVideo sv, Map<Long, Integer> authorCount,
                                        Map<String, Integer> catCount,
                                        Map<String, Integer> typeCount,
@@ -1203,12 +1417,8 @@ public class RecommendationEngine {
 
     private Set<Long> getRecentExposures(Long userId) {
         LocalDateTime since = LocalDateTime.now().minusHours(RecommendationConfig.DIVERSITY_RECENT_HOURS);
-        return exposureMapper.selectList(new LambdaQueryWrapper<VideoExposure>()
-                .eq(VideoExposure::getUserId, userId)
-                .ge(VideoExposure::getExposureTime, since)
-                .select(VideoExposure::getVideoId))
-                .stream().map(VideoExposure::getVideoId)
-                .collect(Collectors.toSet());
+        return new HashSet<>(exposureMapper.findRecentVideoIds(
+                userId, since, MAX_EXPOSURE_EXCLUDES));
     }
 
     private void recordExposuresBatch(Long userId, List<Long> videoIds) {
@@ -1224,6 +1434,12 @@ public class RecommendationEngine {
         }
     }
 
+    /** Record only IDs actually returned to a viewer. */
+    public void recordExposures(Long userId, List<Long> videoIds) {
+        if (userId == null || videoIds == null || videoIds.isEmpty()) return;
+        recordExposuresBatch(userId, videoIds);
+    }
+
     // ===================== 工具方法 =====================
 
     private Map<Long, VideoContent> loadContentMap(List<Long> videoIds) {
@@ -1234,7 +1450,7 @@ public class RecommendationEngine {
 
     private Set<Long> getFollowedSet(Long userId) {
         return followMapper.selectList(new LambdaQueryWrapper<Follow>()
-                .eq(Follow::getUserId, userId).select(Follow::getFollowId))
+                .eq(Follow::getUserId, userId))
                 .stream().map(Follow::getFollowId).collect(Collectors.toSet());
     }
 
@@ -1245,6 +1461,18 @@ public class RecommendationEngine {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /** Prefer the fused vector, then long-term, then short-term interest. */
+    private String profileVector(UserContentProfile profile) {
+        if (profile == null) return null;
+        if (profile.getContentVector() != null && !profile.getContentVector().isBlank()) {
+            return profile.getContentVector();
+        }
+        if (profile.getLongTermVector() != null && !profile.getLongTermVector().isBlank()) {
+            return profile.getLongTermVector();
+        }
+        return profile.getShortTermVector();
     }
 
     private double cosineSim(List<Double> a, VideoContent vc) {

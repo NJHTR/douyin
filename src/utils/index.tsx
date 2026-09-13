@@ -412,7 +412,7 @@ export function _notice(
 }
 
 export function _no() {
-  _notice('未实现')
+  _notice('该功能即将上线')
 }
 
 /**

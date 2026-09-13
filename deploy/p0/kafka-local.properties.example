@@ -1,0 +1,13 @@
+# Local Kafka acceptance profile for a broker running on the Windows host.
+# Copy the regular Kafka config/server.properties, then apply these values.
+broker.id=0
+listeners=LOCAL://0.0.0.0:9092,DOCKER://0.0.0.0:29092
+advertised.listeners=LOCAL://localhost:9092,DOCKER://host.docker.internal:29092
+listener.security.protocol.map=LOCAL:PLAINTEXT,DOCKER:PLAINTEXT
+inter.broker.listener.name=LOCAL
+offsets.topic.replication.factor=1
+transaction.state.log.replication.factor=1
+transaction.state.log.min.isr=1
+
+# Use a disposable absolute directory outside the repository for fault tests.
+# log.dirs=D:/kafka_2.13-3.9.2/kafka-logs-codex-acceptance

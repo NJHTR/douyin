@@ -8,6 +8,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -115,17 +116,31 @@ public class UserProfileService {
         return profile;
     }
 
+    /**
+     * Load a profile under an InnoDB row lock. The lock is deliberately held
+     * by the caller's transaction until the projection is persisted, which
+     * serializes updates from different API instances as well as local tasks.
+     */
+    private UserContentProfile getOrCreateForUpdate(Long userId) {
+        if (userId == null) return getOrCreate(null);
+        profileMapper.insertIfAbsent(userId);
+        UserContentProfile profile = profileMapper.selectForUpdate(userId);
+        return profile != null ? profile : getOrCreate(userId);
+    }
+
     // ===================== 实时增量更新 =====================
 
     /** 观看视频后更新画像 */
+    @Transactional
     public void onWatch(Long userId, Long videoId, Long authorId, double watchDurationSec,
                         double videoDurationSec, String trafficSource,
                         String sessionId, double swipeSeconds) {
-        UserContentProfile p = getOrCreate(userId);
+        UserContentProfile p = getOrCreateForUpdate(userId);
         VideoContent vc = contentMapper.selectById(videoId);
 
         boolean finished = videoDurationSec > 0 && watchDurationSec >= videoDurationSec * RecommendationConfig.CAT_WELL_WATCHED_COMPLETION;
-        boolean isBounce = watchDurationSec < RecommendationConfig.UP_BOUNCE_THRESHOLD_SEC;
+        double effectiveSwipeSeconds = swipeSeconds >= 0 ? swipeSeconds : watchDurationSec;
+        boolean isBounce = effectiveSwipeSeconds < RecommendationConfig.UP_BOUNCE_THRESHOLD_SEC;
         double completion = videoDurationSec > 0
                 ? Math.min(1.0, watchDurationSec / videoDurationSec) : 0;
 
@@ -149,12 +164,21 @@ public class UserProfileService {
         p.setTotalWatchTimeSec((p.getTotalWatchTimeSec() != null ? p.getTotalWatchTimeSec() : 0)
                 + (long) watchDurationSec);
 
-        // 内容向量: 短期 EMA 更新
-        if (vc != null && vc.getContentVector() != null) {
-            updateContentVectorEMA(p, vc.getContentVector(), true);
+        // 内容向量: short/long 双 EMA + 融合向量。
+        // 过去这里只写 short_term_vector，导致 content_vector 长期为空，
+        // 召回只能按全站固定顺序，所有账号的候选池高度重合。
+        if (vc != null && !isBounce) {
+            if (vc.getContentVector() != null) {
+                updateContentVectorEMA(p, vc.getContentVector(), true);
+                updateContentVectorEMA(p, vc.getContentVector(), false);
+                fuseContentVectors(p);
+            }
             updateCategoryWeights(p, vc.getTextCategory(), watchDurationSec);
-            updateCreatorAffinity(p, authorId, watchDurationSec, isBounce);
         }
+        // A quick swipe is negative creator evidence, not positive semantic
+        // interest. Keep that signal while avoiding a false vector/category
+        // preference for content the viewer immediately rejected.
+        updateCreatorAffinity(p, authorId, watchDurationSec, isBounce);
 
         // 动态标签: 共观扩散 (session 内连续观看)
         if (sessionId != null && !sessionId.isEmpty()) {
@@ -213,8 +237,9 @@ public class UserProfileService {
     }
 
     /** 点赞 */
+    @Transactional
     public void onLike(Long userId, Long videoId, Long authorId) {
-        UserContentProfile p = getOrCreate(userId);
+        UserContentProfile p = getOrCreateForUpdate(userId);
         p.setTotalLikeCount((p.getTotalLikeCount() != null ? p.getTotalLikeCount() : 0) + 1);
         p.setTotalInteractCount((p.getTotalInteractCount() != null ? p.getTotalInteractCount() : 0) + 1);
         updateRate("like", p);
@@ -224,8 +249,9 @@ public class UserProfileService {
     }
 
     /** 收藏 */
+    @Transactional
     public void onCollect(Long userId, Long videoId, Long authorId) {
-        UserContentProfile p = getOrCreate(userId);
+        UserContentProfile p = getOrCreateForUpdate(userId);
         p.setTotalCollectCount((p.getTotalCollectCount() != null ? p.getTotalCollectCount() : 0) + 1);
         p.setTotalInteractCount((p.getTotalInteractCount() != null ? p.getTotalInteractCount() : 0) + 1);
         updateRate("collect", p);
@@ -239,8 +265,9 @@ public class UserProfileService {
     }
 
     /** 分享 */
+    @Transactional
     public void onShare(Long userId, Long videoId, Long authorId) {
-        UserContentProfile p = getOrCreate(userId);
+        UserContentProfile p = getOrCreateForUpdate(userId);
         p.setTotalShareCount((p.getTotalShareCount() != null ? p.getTotalShareCount() : 0) + 1);
         p.setTotalInteractCount((p.getTotalInteractCount() != null ? p.getTotalInteractCount() : 0) + 1);
         updateRate("share", p);
@@ -250,8 +277,9 @@ public class UserProfileService {
     }
 
     /** 评论 */
+    @Transactional
     public void onComment(Long userId, Long videoId, Long authorId) {
-        UserContentProfile p = getOrCreate(userId);
+        UserContentProfile p = getOrCreateForUpdate(userId);
         p.setTotalCommentCount((p.getTotalCommentCount() != null ? p.getTotalCommentCount() : 0) + 1);
         p.setTotalInteractCount((p.getTotalInteractCount() != null ? p.getTotalInteractCount() : 0) + 1);
         updateRate("comment", p);
@@ -261,8 +289,9 @@ public class UserProfileService {
     }
 
     /** 关注 */
+    @Transactional
     public void onFollow(Long userId, Long followId) {
-        UserContentProfile p = getOrCreate(userId);
+        UserContentProfile p = getOrCreateForUpdate(userId);
         updateCreatorAffinity(p, followId, RecommendationConfig.UP_AFF_INC_FOLLOW, false);
         p.setSocialEngagementRate(
                 Math.min(1.0, (p.getSocialEngagementRate() != null ? p.getSocialEngagementRate() : 0)
@@ -272,8 +301,9 @@ public class UserProfileService {
     }
 
     /** 搜索 */
+    @Transactional
     public void onSearch(Long userId, String keyword) {
-        UserContentProfile p = getOrCreate(userId);
+        UserContentProfile p = getOrCreateForUpdate(userId);
         p.setTotalSearchCount((p.getTotalSearchCount() != null ? p.getTotalSearchCount() : 0) + 1);
 
         // 搜索频率 (每10次观看的搜索次数)
@@ -295,8 +325,9 @@ public class UserProfileService {
     }
 
     /** 浏览他人主页 */
+    @Transactional
     public void onProfileVisit(Long userId, Long visitedUserId) {
-        UserContentProfile p = getOrCreate(userId);
+        UserContentProfile p = getOrCreateForUpdate(userId);
         p.setProfileVisitCount((p.getProfileVisitCount() != null ? p.getProfileVisitCount() : 0) + 1);
         p.setSocialEngagementRate(
                 Math.min(1.0, (p.getSocialEngagementRate() != null ? p.getSocialEngagementRate() : 0)
@@ -307,16 +338,18 @@ public class UserProfileService {
     }
 
     /** 评论点赞 */
+    @Transactional
     public void onCommentLike(Long userId, Long commentId, Long videoId) {
-        UserContentProfile p = getOrCreate(userId);
+        UserContentProfile p = getOrCreateForUpdate(userId);
         p.setTotalInteractCount((p.getTotalInteractCount() != null ? p.getTotalInteractCount() : 0) + 1);
         p.setUpdateTime(LocalDateTime.now());
         profileMapper.insertOrUpdate(p);
     }
 
     /** 评论点踩 */
+    @Transactional
     public void onCommentDislike(Long userId, Long commentId, Long videoId) {
-        UserContentProfile p = getOrCreate(userId);
+        UserContentProfile p = getOrCreateForUpdate(userId);
         p.setTotalInteractCount((p.getTotalInteractCount() != null ? p.getTotalInteractCount() : 0) + 1);
         p.setUpdateTime(LocalDateTime.now());
         profileMapper.insertOrUpdate(p);
@@ -340,8 +373,9 @@ public class UserProfileService {
     }
 
     /** 重建单个用户画像 */
+    @Transactional
     public void rebuildProfile(Long userId) {
-        UserContentProfile p = getOrCreate(userId);
+        UserContentProfile p = getOrCreateForUpdate(userId);
 
         // 从各数据源统计
         countWatches(p);
@@ -600,11 +634,12 @@ public class UserProfileService {
         List<Double> newVec = parseVector(contentVectorJson);
         if (newVec == null || newVec.isEmpty()) return;
 
-        String existingJson = isShortTerm ? p.getShortTermVector() : p.getContentVector();
+        String existingJson = isShortTerm
+                ? p.getShortTermVector()
+                : (p.getLongTermVector() != null ? p.getLongTermVector() : p.getContentVector());
         List<Double> existing = parseVector(existingJson);
 
         double alpha = isShortTerm ? EMA_ALPHA_SHORT : EMA_ALPHA_LONG;
-        String targetField = isShortTerm ? "shortTermVector" : "contentVector";
 
         if (existing == null || existing.size() != newVec.size()) {
             // 首次: 直接设置
@@ -612,7 +647,7 @@ public class UserProfileService {
                 if (isShortTerm) {
                     p.setShortTermVector(contentVectorJson);
                 } else {
-                    p.setContentVector(contentVectorJson);
+                    p.setLongTermVector(contentVectorJson);
                 }
             } catch (Exception ignored) {}
             return;
@@ -626,7 +661,26 @@ public class UserProfileService {
         try {
             String json = objectMapper.writeValueAsString(updated);
             if (isShortTerm) p.setShortTermVector(json);
-            else p.setContentVector(json);
+            else p.setLongTermVector(json);
+        } catch (JsonProcessingException ignored) {}
+    }
+
+    /** Build the vector consumed by ranking from both time horizons. */
+    private void fuseContentVectors(UserContentProfile p) {
+        List<Double> shortVec = parseVector(p.getShortTermVector());
+        List<Double> longVec = parseVector(p.getLongTermVector());
+        if (shortVec == null && longVec == null) return;
+        if (shortVec == null || longVec == null || shortVec.size() != longVec.size()) {
+            p.setContentVector(shortVec != null ? p.getShortTermVector() : p.getLongTermVector());
+            return;
+        }
+        List<Double> fused = new ArrayList<>(shortVec.size());
+        for (int i = 0; i < shortVec.size(); i++) {
+            fused.add(longVec.get(i) * RecommendationConfig.CM_LONG_W
+                    + shortVec.get(i) * RecommendationConfig.CM_SHORT_W);
+        }
+        try {
+            p.setContentVector(objectMapper.writeValueAsString(fused));
         } catch (JsonProcessingException ignored) {}
     }
 

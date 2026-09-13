@@ -189,11 +189,15 @@ public class SessionService {
 
     // ==================== 僵尸会话清理 ====================
 
-    /** 每 5 分钟清理一次超时僵尸会话 (超过 30 分钟未活跃) */
+    /**
+     * 每 5 分钟清理一次超时僵尸会话。
+     * JWT 默认有效期为 7 天；按最后请求 30 分钟清理会让关闭浏览器的用户
+     * 在重新打开时被迫登录，即使 localStorage 中的 JWT 仍未过期。
+     */
     @Scheduled(fixedRate = 300_000)
     public void cleanupStaleSessions() {
         try {
-            LocalDateTime threshold = LocalDateTime.now().minusMinutes(30);
+            LocalDateTime threshold = LocalDateTime.now().minusDays(7);
             int revoked = sessionMapper.revokeStale(threshold);
             if (revoked > 0) {
                 // 清理内存缓存 — 全量重建 (简单可靠, 数量不大)
